@@ -562,3 +562,133 @@ def test_results_are_deterministic() -> None:
         first.categorical_rates_frame(),
         second.categorical_rates_frame(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Multiclass numerical feature-to-target analysis
+# ---------------------------------------------------------------------------
+
+from scripts.analyze_target_relationships import (
+    analyze_multiclass_numerical_target_relationships,
+    plot_multiclass_feature_target_associations,
+)
+
+
+def _multiclass_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "separated": [1.0, 1.2, 1.1, 5.0, 5.2, 5.1, 9.0, 9.2, 9.1],
+            "overlap": [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
+            "Class": ["A"] * 3 + ["B"] * 3 + ["C"] * 3,
+        }
+    )
+
+
+def test_multiclass_analysis_uses_unordered_target_without_positive_class() -> None:
+    report = analyze_multiclass_numerical_target_relationships(
+        _multiclass_frame(),
+        features=("separated", "overlap"),
+        target="Class",
+        expected_target_classes=("A", "B", "C"),
+        association_review_threshold=0.10,
+    )
+
+    assert report.is_analysis_ready
+    assert report.expected_target_classes == ("A", "B", "C")
+    assert report.has_review_candidates
+    assert "Positive-class count" not in report.relationships_frame().columns
+
+
+def test_multiclass_eta_squared_identifies_mean_separation() -> None:
+    report = analyze_multiclass_numerical_target_relationships(
+        _multiclass_frame(),
+        features=("separated", "overlap"),
+        target="Class",
+        expected_target_classes=("A", "B", "C"),
+        association_review_threshold=0.10,
+    )
+    relationships = report.relationships_frame().set_index("Feature")
+
+    assert relationships.loc["separated", "Eta squared"] > 0.99
+    assert relationships.loc["overlap", "Eta squared"] == pytest.approx(0.0)
+    assert bool(relationships.loc["separated", "Review flag"])
+    assert not bool(relationships.loc["overlap", "Review flag"])
+
+
+def test_multiclass_rank_eta_squared_is_bounded() -> None:
+    report = analyze_multiclass_numerical_target_relationships(
+        _multiclass_frame(),
+        features=("separated",),
+        target="Class",
+        expected_target_classes=("A", "B", "C"),
+    )
+    value = report.relationships_frame().iloc[0]["Rank eta squared"]
+    assert 0.0 <= value <= 1.0
+
+
+def test_multiclass_class_statistics_preserve_contract_order() -> None:
+    report = analyze_multiclass_numerical_target_relationships(
+        _multiclass_frame(),
+        features=("separated",),
+        target="Class",
+        expected_target_classes=("C", "A", "B"),
+    )
+    statistics = report.class_statistics_frame()
+    assert list(statistics["Target class"]) == ["C", "A", "B"]
+
+
+def test_multiclass_missing_feature_blocks_validation() -> None:
+    report = analyze_multiclass_numerical_target_relationships(
+        _multiclass_frame(),
+        features=("separated", "missing"),
+        target="Class",
+        expected_target_classes=("A", "B", "C"),
+    )
+    assert report.missing_features == ("missing",)
+    with pytest.raises(FeatureTargetAnalysisError, match="missing_features"):
+        report.raise_if_invalid()
+
+
+def test_multiclass_unexpected_target_class_blocks_validation() -> None:
+    frame = _multiclass_frame()
+    frame.loc[0, "Class"] = "OTHER"
+    report = analyze_multiclass_numerical_target_relationships(
+        frame,
+        features=("separated",),
+        target="Class",
+        expected_target_classes=("A", "B", "C"),
+    )
+    assert report.has_unexpected_target_classes
+    with pytest.raises(FeatureTargetAnalysisError, match="unexpected_target_classes"):
+        report.raise_if_invalid()
+
+
+def test_multiclass_constant_feature_can_be_required_to_vary() -> None:
+    frame = _multiclass_frame().assign(constant=1.0)
+    report = analyze_multiclass_numerical_target_relationships(
+        frame,
+        features=("constant",),
+        target="Class",
+        expected_target_classes=("A", "B", "C"),
+    )
+    assert report.has_constant_features
+    with pytest.raises(FeatureTargetAnalysisError, match="constant_features"):
+        report.raise_if_invalid(require_sufficient_variation=True)
+
+
+def test_multiclass_plot_returns_figure_without_mutating_report() -> None:
+    pytest.importorskip("matplotlib")
+    report = analyze_multiclass_numerical_target_relationships(
+        _multiclass_frame(),
+        features=("separated", "overlap"),
+        target="Class",
+        expected_target_classes=("A", "B", "C"),
+    )
+    before = report.relationships_frame()
+    figure = plot_multiclass_feature_target_associations(report)
+    try:
+        assert len(figure.axes) == 1
+        pd.testing.assert_frame_equal(before, report.relationships_frame())
+    finally:
+        import matplotlib.pyplot as plt
+        plt.close(figure)

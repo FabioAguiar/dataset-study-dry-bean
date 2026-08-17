@@ -1447,3 +1447,565 @@ def _find_duplicates(values: Sequence[str]) -> tuple[str, ...]:
             duplicates.append(value)
         seen.add(value)
     return tuple(duplicates)
+
+
+# ---------------------------------------------------------------------------
+# Multiclass numerical feature-to-target analysis
+# ---------------------------------------------------------------------------
+
+_MULTICLASS_NUMERICAL_RELATIONSHIP_COLUMNS: Final[list[str]] = [
+    "Feature",
+    "Valid paired rows",
+    "Missing paired rows",
+    "Eta squared",
+    "Rank eta squared",
+    "Maximum association",
+    "Class mean minimum",
+    "Class mean maximum",
+    "Class mean range",
+    "Review flag",
+    "Interpretation",
+]
+
+_MULTICLASS_CLASS_STATISTICS_COLUMNS: Final[list[str]] = [
+    "Feature",
+    "Target class",
+    "Row count",
+    "Valid numeric count",
+    "Mean",
+    "Median",
+    "Standard deviation",
+    "Minimum",
+    "Maximum",
+    "IQR",
+]
+
+_MULTICLASS_ISSUE_COLUMNS: Final[list[str]] = [
+    "Scope",
+    "Feature",
+    "Issue",
+    "Details",
+    "Potential impact",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class MulticlassFeatureTargetRelationshipReport:
+    """Summarize univariate numerical relationships with a multiclass target."""
+
+    requested_features: tuple[str, ...]
+    available_features: tuple[str, ...]
+    missing_features: tuple[str, ...]
+    target_name: str
+    expected_target_classes: tuple[object, ...]
+    observed_target_classes: tuple[object, ...]
+    unexpected_target_classes: tuple[object, ...]
+    missing_expected_target_classes: tuple[object, ...]
+    row_count: int
+    missing_target_count: int
+    association_review_threshold: float
+    relationships: pd.DataFrame
+    class_statistics: pd.DataFrame
+    issues: pd.DataFrame
+
+    @property
+    def has_missing_features(self) -> bool:
+        return bool(self.missing_features)
+
+    @property
+    def has_missing_target_values(self) -> bool:
+        return self.missing_target_count > 0
+
+    @property
+    def has_unexpected_target_classes(self) -> bool:
+        return bool(self.unexpected_target_classes)
+
+    @property
+    def has_missing_expected_target_classes(self) -> bool:
+        return bool(self.missing_expected_target_classes)
+
+    @property
+    def has_constant_features(self) -> bool:
+        if self.issues.empty:
+            return False
+        return bool(self.issues["Issue"].eq("Constant numerical feature").any())
+
+    @property
+    def has_review_candidates(self) -> bool:
+        if self.relationships.empty:
+            return False
+        return bool(self.relationships["Review flag"].any())
+
+    @property
+    def is_analysis_ready(self) -> bool:
+        return not (
+            self.has_missing_features
+            or self.has_missing_target_values
+            or self.has_unexpected_target_classes
+            or self.has_missing_expected_target_classes
+            or len(self.expected_target_classes) < 3
+        )
+
+    def summary_frame(self) -> pd.DataFrame:
+        """Return a compact multiclass feature-to-target summary."""
+        candidates = (
+            0
+            if self.relationships.empty
+            else int(self.relationships["Review flag"].sum())
+        )
+        rows = [
+            {
+                "Metric": "Rows",
+                "Value": self.row_count,
+                "Interpretation": "Observations supplied to the analysis",
+            },
+            {
+                "Metric": "Numerical features",
+                "Value": len(self.requested_features),
+                "Interpretation": "Candidate numerical features requested",
+            },
+            {
+                "Metric": "Target classes",
+                "Value": len(self.expected_target_classes),
+                "Interpretation": "Classes declared by the target contract",
+            },
+            {
+                "Metric": "Association review threshold",
+                "Value": self.association_review_threshold,
+                "Interpretation": (
+                    "Applied to max(eta squared, rank eta squared); review only"
+                ),
+            },
+            {
+                "Metric": "Review candidates",
+                "Value": candidates,
+                "Interpretation": (
+                    "Features meeting the exploratory association threshold"
+                ),
+            },
+        ]
+        return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
+
+    def relationships_frame(self) -> pd.DataFrame:
+        """Return feature-level multiclass association evidence."""
+        if self.relationships.empty:
+            return self.relationships.copy(deep=True)
+        return self.relationships.sort_values(
+            ["Maximum association", "Feature"],
+            ascending=[False, True],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    def review_frame(self) -> pd.DataFrame:
+        """Return only features reaching the exploratory review threshold."""
+        frame = self.relationships_frame()
+        if frame.empty:
+            return frame
+        return frame.loc[frame["Review flag"]].reset_index(drop=True)
+
+    def class_statistics_frame(self) -> pd.DataFrame:
+        """Return per-feature descriptive statistics for every target class."""
+        return self.class_statistics.copy(deep=True)
+
+    def issues_frame(self) -> pd.DataFrame:
+        """Return structural conditions that may limit interpretation."""
+        return self.issues.copy(deep=True)
+
+    def raise_if_invalid(
+        self,
+        *,
+        require_features_present: bool = True,
+        require_multiclass_target: bool = True,
+        require_no_missing_target: bool = True,
+        require_expected_target_classes: bool = True,
+        require_no_unexpected_target_classes: bool = True,
+        require_sufficient_variation: bool = False,
+    ) -> None:
+        """Raise when configured multiclass analysis requirements fail."""
+        failures: list[str] = []
+
+        if require_features_present and self.missing_features:
+            failures.append("missing_features:" + ",".join(self.missing_features))
+
+        if require_multiclass_target and len(self.expected_target_classes) < 3:
+            failures.append("target_contract_is_not_multiclass")
+
+        if require_no_missing_target and self.has_missing_target_values:
+            failures.append(f"missing_target_values:{self.missing_target_count}")
+
+        if (
+            require_expected_target_classes
+            and self.has_missing_expected_target_classes
+        ):
+            failures.append(
+                "missing_expected_target_classes:"
+                + ",".join(
+                    repr(value) for value in self.missing_expected_target_classes
+                )
+            )
+
+        if (
+            require_no_unexpected_target_classes
+            and self.has_unexpected_target_classes
+        ):
+            failures.append(
+                "unexpected_target_classes:"
+                + ",".join(
+                    repr(value) for value in self.unexpected_target_classes
+                )
+            )
+
+        if require_sufficient_variation and self.has_constant_features:
+            failures.append("constant_features_detected")
+
+        if failures:
+            raise FeatureTargetAnalysisError(
+                "Multiclass feature-to-target analysis is invalid: "
+                + "; ".join(failures)
+            )
+
+
+def analyze_multiclass_numerical_target_relationships(
+    dataframe: pd.DataFrame,
+    *,
+    features: Sequence[str],
+    target: str,
+    expected_target_classes: Sequence[object],
+    association_review_threshold: Real = 0.10,
+) -> MulticlassFeatureTargetRelationshipReport:
+    """Analyze numerical features against an unordered multiclass target.
+
+    Eta squared measures the share of numerical variance associated with
+    between-class differences in means. Rank eta squared applies the same
+    decomposition to within-feature ranks, providing a complementary,
+    scale-insensitive view of class-conditioned separation.
+    """
+    _validate_dataframe(dataframe, name="dataframe")
+
+    requested_features = _normalize_feature_names(features, name="features")
+    if not isinstance(target, str) or not target.strip():
+        raise FeatureTargetAnalysisError("target must be a non-empty string.")
+    target_name = target.strip()
+    expected_classes = _normalize_values(
+        expected_target_classes,
+        name="expected_target_classes",
+    )
+    if len(expected_classes) < 3:
+        raise FeatureTargetAnalysisError(
+            "expected_target_classes must contain at least three classes."
+        )
+
+    threshold = _validate_unit_threshold(
+        association_review_threshold,
+        name="association_review_threshold",
+    )
+
+    source = dataframe.copy(deep=True)
+    if source.columns.duplicated().any():
+        raise FeatureTargetAnalysisError(
+            "dataframe must not contain duplicated column labels."
+        )
+    if target_name not in source.columns:
+        raise FeatureTargetAnalysisError(
+            f"Target column {target_name!r} is not present in dataframe."
+        )
+
+    available_features = tuple(
+        feature for feature in requested_features if feature in source.columns
+    )
+    missing_features = tuple(
+        feature for feature in requested_features if feature not in source.columns
+    )
+
+    target_source = source[target_name].copy(deep=True)
+    observed_classes = tuple(pd.unique(target_source.dropna()))
+    unexpected_classes = tuple(
+        value for value in observed_classes if value not in expected_classes
+    )
+    missing_expected_classes = tuple(
+        value for value in expected_classes if value not in observed_classes
+    )
+    missing_target_count = int(target_source.isna().sum())
+
+    issues: list[dict[str, object]] = []
+    for feature in missing_features:
+        issues.append(_missing_feature_issue("Numerical", feature))
+
+    if missing_target_count:
+        issues.append(
+            {
+                "Scope": "Target contract",
+                "Feature": None,
+                "Issue": "Missing target values",
+                "Details": f"count={missing_target_count}",
+                "Potential impact": (
+                    "Unlabelled rows cannot support supervised relationships."
+                ),
+            }
+        )
+    if unexpected_classes:
+        issues.append(
+            {
+                "Scope": "Target contract",
+                "Feature": None,
+                "Issue": "Unexpected target classes",
+                "Details": ", ".join(repr(v) for v in unexpected_classes),
+                "Potential impact": (
+                    "Observed outcomes do not match the declared target contract."
+                ),
+            }
+        )
+    if missing_expected_classes:
+        issues.append(
+            {
+                "Scope": "Target contract",
+                "Feature": None,
+                "Issue": "Missing expected target classes",
+                "Details": ", ".join(
+                    repr(v) for v in missing_expected_classes
+                ),
+                "Potential impact": (
+                    "The full multiclass contract is not represented in the data."
+                ),
+            }
+        )
+
+    can_analyze = (
+        not missing_features
+        and not unexpected_classes
+        and not missing_expected_classes
+        and missing_target_count == 0
+    )
+
+    relationship_rows: list[dict[str, object]] = []
+    class_rows: list[dict[str, object]] = []
+
+    if can_analyze:
+        for feature in available_features:
+            numeric = pd.to_numeric(source[feature], errors="coerce")
+            paired = pd.DataFrame(
+                {"value": numeric, "target": target_source}
+            ).dropna()
+            missing_paired = len(source) - len(paired)
+
+            if paired["value"].nunique(dropna=True) < 2:
+                issues.append(_constant_feature_issue("Numerical", feature))
+                eta_squared = None
+                rank_eta_squared = None
+            else:
+                eta_squared = _eta_squared_multiclass(
+                    paired["value"],
+                    paired["target"],
+                )
+                ranked = paired["value"].rank(method="average")
+                rank_eta_squared = _eta_squared_multiclass(
+                    ranked,
+                    paired["target"],
+                )
+
+            per_class = _multiclass_numerical_class_statistics(
+                paired,
+                feature=feature,
+                expected_classes=expected_classes,
+            )
+            class_rows.extend(per_class)
+
+            means = [
+                row["Mean"]
+                for row in per_class
+                if row["Mean"] is not None
+            ]
+            class_mean_minimum = min(means) if means else None
+            class_mean_maximum = max(means) if means else None
+            class_mean_range = (
+                class_mean_maximum - class_mean_minimum
+                if class_mean_minimum is not None
+                and class_mean_maximum is not None
+                else None
+            )
+            candidates = [
+                value
+                for value in (eta_squared, rank_eta_squared)
+                if value is not None
+            ]
+            maximum_association = max(candidates) if candidates else None
+            review_flag = bool(
+                maximum_association is not None
+                and maximum_association >= threshold
+            )
+            interpretation = (
+                "Meets the exploratory univariate association review threshold"
+                if review_flag
+                else "Below the exploratory univariate association review threshold"
+            )
+
+            relationship_rows.append(
+                {
+                    "Feature": feature,
+                    "Valid paired rows": len(paired),
+                    "Missing paired rows": missing_paired,
+                    "Eta squared": eta_squared,
+                    "Rank eta squared": rank_eta_squared,
+                    "Maximum association": maximum_association,
+                    "Class mean minimum": class_mean_minimum,
+                    "Class mean maximum": class_mean_maximum,
+                    "Class mean range": class_mean_range,
+                    "Review flag": review_flag,
+                    "Interpretation": interpretation,
+                }
+            )
+
+    return MulticlassFeatureTargetRelationshipReport(
+        requested_features=requested_features,
+        available_features=available_features,
+        missing_features=missing_features,
+        target_name=target_name,
+        expected_target_classes=expected_classes,
+        observed_target_classes=observed_classes,
+        unexpected_target_classes=unexpected_classes,
+        missing_expected_target_classes=missing_expected_classes,
+        row_count=len(source),
+        missing_target_count=missing_target_count,
+        association_review_threshold=threshold,
+        relationships=pd.DataFrame(
+            relationship_rows,
+            columns=_MULTICLASS_NUMERICAL_RELATIONSHIP_COLUMNS,
+        ),
+        class_statistics=pd.DataFrame(
+            class_rows,
+            columns=_MULTICLASS_CLASS_STATISTICS_COLUMNS,
+        ),
+        issues=pd.DataFrame(issues, columns=_MULTICLASS_ISSUE_COLUMNS),
+    )
+
+
+def plot_multiclass_feature_target_associations(
+    report: MulticlassFeatureTargetRelationshipReport,
+    *,
+    title: str = "Multiclass Feature-to-Target Associations",
+):
+    """Plot eta-squared and rank-eta-squared evidence for each feature."""
+    if not isinstance(report, MulticlassFeatureTargetRelationshipReport):
+        raise FeatureTargetAnalysisError(
+            "report must be a MulticlassFeatureTargetRelationshipReport."
+        )
+    frame = report.relationships_frame()
+    if frame.empty:
+        raise FeatureTargetAnalysisError(
+            "No numerical relationship evidence is available to plot."
+        )
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:  # pragma: no cover - notebook dependency
+        raise FeatureTargetAnalysisError(
+            "matplotlib is required to plot feature-to-target associations."
+        ) from exc
+
+    plot_frame = frame.sort_values(
+        ["Maximum association", "Feature"],
+        ascending=[True, True],
+        na_position="first",
+    ).reset_index(drop=True)
+    positions = list(range(len(plot_frame)))
+    offset = 0.20
+    figure_height = max(4.5, 0.38 * len(plot_frame) + 1.5)
+    figure, axis = plt.subplots(figsize=(10, figure_height))
+    axis.barh(
+        [position - offset for position in positions],
+        plot_frame["Eta squared"].fillna(0.0),
+        height=0.36,
+        label="Eta squared",
+    )
+    axis.barh(
+        [position + offset for position in positions],
+        plot_frame["Rank eta squared"].fillna(0.0),
+        height=0.36,
+        label="Rank eta squared",
+    )
+    axis.axvline(
+        report.association_review_threshold,
+        linestyle="--",
+        linewidth=1,
+        label=f"Review threshold ({report.association_review_threshold:.2f})",
+    )
+    axis.set_yticks(positions)
+    axis.set_yticklabels(plot_frame["Feature"])
+    axis.set_xlim(left=0.0, right=1.0)
+    axis.set_xlabel("Association strength (0–1)")
+    axis.set_ylabel("Feature")
+    axis.set_title(title)
+    axis.legend()
+    figure.tight_layout()
+    return figure
+
+
+def _eta_squared_multiclass(values: pd.Series, target: pd.Series) -> float | None:
+    """Return one-way eta squared for a numerical series and class labels."""
+    if len(values) != len(target) or len(values) == 0:
+        return None
+    numeric = pd.to_numeric(values, errors="coerce")
+    valid = numeric.notna() & target.notna()
+    numeric = numeric.loc[valid].astype(float)
+    labels = target.loc[valid]
+    if len(numeric) == 0 or numeric.nunique(dropna=True) < 2:
+        return None
+
+    overall_mean = float(numeric.mean())
+    total_ss = float(((numeric - overall_mean) ** 2).sum())
+    if total_ss <= 0:
+        return None
+
+    between_ss = 0.0
+    for label in pd.unique(labels):
+        group = numeric.loc[labels.eq(label)]
+        if group.empty:
+            continue
+        between_ss += len(group) * (float(group.mean()) - overall_mean) ** 2
+
+    return max(0.0, min(1.0, float(between_ss / total_ss)))
+
+
+def _multiclass_numerical_class_statistics(
+    paired: pd.DataFrame,
+    *,
+    feature: str,
+    expected_classes: tuple[object, ...],
+) -> list[dict[str, object]]:
+    """Return deterministic descriptive statistics in target-contract order."""
+    rows: list[dict[str, object]] = []
+    for target_class in expected_classes:
+        group = paired.loc[paired["target"].eq(target_class), "value"]
+        valid_count = int(group.notna().sum())
+        if valid_count:
+            q1 = float(group.quantile(0.25))
+            q3 = float(group.quantile(0.75))
+            row = {
+                "Feature": feature,
+                "Target class": target_class,
+                "Row count": int(paired["target"].eq(target_class).sum()),
+                "Valid numeric count": valid_count,
+                "Mean": float(group.mean()),
+                "Median": float(group.median()),
+                "Standard deviation": (
+                    float(group.std(ddof=1)) if valid_count > 1 else None
+                ),
+                "Minimum": float(group.min()),
+                "Maximum": float(group.max()),
+                "IQR": q3 - q1,
+            }
+        else:
+            row = {
+                "Feature": feature,
+                "Target class": target_class,
+                "Row count": 0,
+                "Valid numeric count": 0,
+                "Mean": None,
+                "Median": None,
+                "Standard deviation": None,
+                "Minimum": None,
+                "Maximum": None,
+                "IQR": None,
+            }
+        rows.append(row)
+    return rows
