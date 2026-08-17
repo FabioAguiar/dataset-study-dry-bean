@@ -8,6 +8,8 @@ import pytest
 from scripts.analyze_relationships import (
     FeatureRelationshipAnalysisError,
     analyze_feature_relationships,
+    analyze_numerical_feature_relationships,
+    plot_numerical_correlation_heatmap,
 )
 
 
@@ -484,3 +486,135 @@ def test_summary_reports_expected_pair_counts() -> None:
     assert summary.loc["Numerical relationships", "Value"] == 3
     assert summary.loc["Categorical relationships", "Value"] == 1
     assert summary.loc["Categorical-numerical relationships", "Value"] == 6
+
+
+def test_numerical_wrapper_uses_empty_categorical_projection() -> None:
+    frame = pd.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0],
+            "b": [2.0, 4.0, 6.0],
+            "c": [3.0, 1.0, 2.0],
+        }
+    )
+
+    report = analyze_numerical_feature_relationships(
+        frame,
+        features=("a", "b", "c"),
+        strong_association_threshold=0.8,
+        redundancy_review_threshold=0.9,
+    )
+
+    assert report.requested_categorical_features == ()
+    assert report.available_categorical_features == ()
+    assert len(report.numerical_relationships_frame()) == 3
+
+
+def test_numerical_review_frame_filters_and_sorts_strong_pairs() -> None:
+    frame = pd.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0, 4.0],
+            "b": [2.0, 4.0, 6.0, 8.0],
+            "c": [1.0, 4.0, 9.0, 16.0],
+            "d": [0.0, 1.0, 0.0, 1.0],
+        }
+    )
+    report = analyze_numerical_feature_relationships(
+        frame,
+        features=("a", "b", "c", "d"),
+        strong_association_threshold=0.8,
+        redundancy_review_threshold=0.9,
+    )
+
+    review = report.numerical_review_frame()
+
+    assert not review.empty
+    assert list(review.columns) == [
+        "Feature A",
+        "Feature B",
+        "Pearson correlation",
+        "Rank correlation",
+        "Maximum absolute association",
+        "Potential redundancy",
+        "Interpretation",
+    ]
+    assert review.iloc[0]["Potential redundancy"]
+    assert (
+        review["Maximum absolute association"]
+        .ge(report.strong_numerical_threshold)
+        .all()
+    )
+
+
+def test_numerical_review_frame_accepts_explicit_threshold() -> None:
+    frame = pd.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0, 4.0],
+            "b": [1.0, 2.0, 4.0, 3.0],
+        }
+    )
+    report = analyze_numerical_feature_relationships(
+        frame,
+        features=("a", "b"),
+    )
+
+    assert report.numerical_review_frame(
+        minimum_absolute_association=0.0
+    ).shape[0] == 1
+
+    with pytest.raises(
+        FeatureRelationshipAnalysisError,
+        match="minimum_absolute_association",
+    ):
+        report.numerical_review_frame(
+            minimum_absolute_association=1.1
+        )
+
+
+def test_correlation_heatmap_returns_figure_without_mutating_report() -> None:
+    from matplotlib import pyplot as plt
+
+    frame = pd.DataFrame(
+        {
+            "a": [1.0, 2.0, 3.0],
+            "b": [2.0, 4.0, 6.0],
+            "c": [3.0, 1.0, 2.0],
+        }
+    )
+    report = analyze_numerical_feature_relationships(
+        frame,
+        features=("a", "b", "c"),
+    )
+    before = report.numerical_correlation_matrix()
+
+    figure = plot_numerical_correlation_heatmap(
+        report,
+        method="pearson",
+        title="Test heatmap",
+    )
+
+    assert figure.axes[0].get_title() == "Test heatmap"
+    pd.testing.assert_frame_equal(
+        report.numerical_correlation_matrix(),
+        before,
+    )
+    plt.close(figure)
+
+
+def test_numerical_summary_omits_irrelevant_categorical_metrics() -> None:
+    frame = pd.DataFrame(
+        {"a": [1.0, 2.0, 3.0], "b": [2.0, 4.0, 6.0]}
+    )
+    report = analyze_numerical_feature_relationships(
+        frame,
+        features=("a", "b"),
+        strong_association_threshold=0.8,
+        redundancy_review_threshold=0.9,
+    )
+
+    summary = report.numerical_summary_frame().set_index("Metric")
+
+    assert summary.loc["Numerical features", "Value"] == 2
+    assert summary.loc["Feature pairs", "Value"] == 1
+    assert summary.loc["Strong-association pairs", "Value"] == 1
+    assert summary.loc["Redundancy-review candidates", "Value"] == 1
+    assert "Categorical relationships" not in summary.index

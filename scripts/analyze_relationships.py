@@ -32,6 +32,16 @@ _NUMERICAL_COLUMNS: Final[list[str]] = [
     "Interpretation",
 ]
 
+_NUMERICAL_REVIEW_COLUMNS: Final[list[str]] = [
+    "Feature A",
+    "Feature B",
+    "Pearson correlation",
+    "Rank correlation",
+    "Maximum absolute association",
+    "Potential redundancy",
+    "Interpretation",
+]
+
 _CATEGORICAL_COLUMNS: Final[list[str]] = [
     "Feature A",
     "Feature B",
@@ -365,9 +375,103 @@ class FeatureRelationshipReport:
         ]
         return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
 
+    def numerical_summary_frame(self) -> pd.DataFrame:
+        """Return a compact summary for all-numerical feature studies."""
+        strong_count = (
+            0
+            if self.numerical_relationships.empty
+            else int(self.numerical_relationships["Strong association"].sum())
+        )
+        redundancy_count = (
+            0
+            if self.numerical_relationships.empty
+            else int(
+                self.numerical_relationships["Potential redundancy"].sum()
+            )
+        )
+        rows = [
+            {
+                "Metric": "Numerical features",
+                "Value": len(self.available_numerical_features),
+                "Interpretation": "Candidate features included in the analysis",
+            },
+            {
+                "Metric": "Feature pairs",
+                "Value": len(self.numerical_relationships),
+                "Interpretation": "Unique numerical feature pairs assessed",
+            },
+            {
+                "Metric": "Strong-association threshold",
+                "Value": self.strong_numerical_threshold,
+                "Interpretation": (
+                    "Absolute Pearson or rank correlation used for review"
+                ),
+            },
+            {
+                "Metric": "Strong-association pairs",
+                "Value": strong_count,
+                "Interpretation": "Pairs meeting the exploratory threshold",
+            },
+            {
+                "Metric": "Redundancy-review threshold",
+                "Value": self.redundancy_review_threshold,
+                "Interpretation": (
+                    "Absolute Pearson correlation used to flag redundancy"
+                ),
+            },
+            {
+                "Metric": "Redundancy-review candidates",
+                "Value": redundancy_count,
+                "Interpretation": (
+                    "Review evidence only; no feature removal is implied"
+                ),
+            },
+        ]
+        return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
+
     def numerical_relationships_frame(self) -> pd.DataFrame:
         """Return pairwise numerical-association evidence."""
         return self.numerical_relationships.copy(deep=True)
+
+    def numerical_review_frame(
+        self,
+        *,
+        minimum_absolute_association: Real | None = None,
+    ) -> pd.DataFrame:
+        """Return strongest numerical relationships for notebook review."""
+        threshold = (
+            self.strong_numerical_threshold
+            if minimum_absolute_association is None
+            else _validate_unit_interval_threshold(
+                minimum_absolute_association,
+                name="minimum_absolute_association",
+            )
+        )
+
+        if self.numerical_relationships.empty:
+            return pd.DataFrame(columns=_NUMERICAL_REVIEW_COLUMNS)
+
+        frame = self.numerical_relationships.copy(deep=True)
+        frame["Maximum absolute association"] = frame[
+            [
+                "Absolute Pearson correlation",
+                "Absolute rank correlation",
+            ]
+        ].max(axis=1, skipna=True)
+        frame = frame.loc[
+            frame["Maximum absolute association"].fillna(0.0).ge(threshold)
+        ]
+        frame = frame.sort_values(
+            by=[
+                "Potential redundancy",
+                "Maximum absolute association",
+                "Feature A",
+                "Feature B",
+            ],
+            ascending=[False, False, True, True],
+            kind="stable",
+        )
+        return frame.loc[:, _NUMERICAL_REVIEW_COLUMNS].reset_index(drop=True)
 
     def categorical_relationships_frame(self) -> pd.DataFrame:
         """Return pairwise categorical-association evidence."""
@@ -662,6 +766,61 @@ def analyze_feature_relationships(
         categorical_cramers_v_matrix=categorical_matrix,
         mixed_eta_squared_matrix=mixed_matrix,
     )
+
+
+def analyze_numerical_feature_relationships(
+    dataframe: pd.DataFrame,
+    *,
+    features: Sequence[str],
+    strong_association_threshold: Real = 0.80,
+    redundancy_review_threshold: Real = 0.90,
+) -> FeatureRelationshipReport:
+    """Analyze an all-numerical feature set with a compact public API."""
+    _validate_dataframe(dataframe, name="dataframe")
+    return analyze_feature_relationships(
+        dataframe,
+        pd.DataFrame(index=dataframe.index),
+        numerical_features=features,
+        categorical_features=(),
+        strong_numerical_threshold=strong_association_threshold,
+        redundancy_review_threshold=redundancy_review_threshold,
+    )
+
+
+def plot_numerical_correlation_heatmap(
+    report: FeatureRelationshipReport,
+    *,
+    method: str = "pearson",
+    title: str | None = None,
+    figure_size: tuple[float, float] = (11.0, 9.0),
+):
+    """Return a compact heatmap for numerical feature relationships."""
+    from matplotlib import pyplot as plt
+
+    if not isinstance(report, FeatureRelationshipReport):
+        raise TypeError("report must be a FeatureRelationshipReport.")
+
+    matrix = report.numerical_correlation_matrix(method=method)
+    if matrix.empty:
+        raise FeatureRelationshipAnalysisError(
+            "cannot plot a correlation heatmap without numerical features."
+        )
+
+    normalized_method = method.strip().casefold()
+    label = "Pearson" if normalized_method == "pearson" else "Spearman rank"
+
+    figure, axis = plt.subplots(figsize=figure_size)
+    image = axis.imshow(matrix.to_numpy(dtype=float), vmin=-1.0, vmax=1.0)
+
+    positions = range(len(matrix.columns))
+    axis.set_xticks(list(positions))
+    axis.set_yticks(list(positions))
+    axis.set_xticklabels(matrix.columns, rotation=60, ha="right")
+    axis.set_yticklabels(matrix.index)
+    axis.set_title(title or f"{label} Feature Correlation")
+    figure.colorbar(image, ax=axis, label="Correlation")
+    figure.tight_layout()
+    return figure
 
 
 def _analyze_numerical_pair(
@@ -1398,6 +1557,21 @@ def _normalize_interactions(
             f"interaction candidate names must be unique: {duplicates!r}"
         )
     return tuple(normalized)
+
+
+def _validate_unit_interval_threshold(
+    value: Real,
+    *,
+    name: str,
+) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number.")
+    numeric = float(value)
+    if not 0 <= numeric <= 1:
+        raise FeatureRelationshipAnalysisError(
+            f"{name} must be between 0 and 1."
+        )
+    return numeric
 
 
 def _validate_thresholds(**thresholds: Real) -> dict[str, float]:
