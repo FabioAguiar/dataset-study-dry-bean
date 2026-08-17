@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from math import isfinite
 from numbers import Real
+from pathlib import Path
 from typing import Final, TypeAlias
 
 import pandas as pd
@@ -18,6 +20,7 @@ _ALLOWED_RULE_FIELDS: Final[set[str]] = {
     "allowed_values",
     "numeric",
     "integer",
+    "finite",
     "minimum",
     "maximum",
     "strip_strings",
@@ -43,6 +46,54 @@ _ISSUE_FRAME_COLUMNS: Final[list[str]] = [
     "Raw value",
     "Count",
 ]
+
+_SOURCE_NUMERIC_TYPES: Final[set[str]] = {
+    "integer",
+    "continuous",
+    "real",
+    "numeric",
+}
+
+_SOURCE_INTEGER_TYPES: Final[set[str]] = {"integer"}
+
+_SOURCE_TEXT_TYPES: Final[set[str]] = {
+    "categorical",
+    "binary",
+    "string",
+}
+
+_ISSUE_IMPACTS: Final[dict[str, str]] = {
+    "Missing value": (
+        "May reduce the usable sample or require an explicit missing-value "
+        "strategy during data preparation."
+    ),
+    "Blank value": (
+        "Represents hidden missingness and may prevent reliable parsing or "
+        "completeness assessment."
+    ),
+    "Inconsistent text": (
+        "May fragment one semantic category into multiple encoded levels."
+    ),
+    "Unexpected value": (
+        "May violate the declared target or categorical value contract."
+    ),
+    "Non-numeric value": (
+        "Prevents reliable quantitative analysis and numeric model input."
+    ),
+    "Non-integer value": (
+        "Violates a source-declared integer field and may indicate malformed data."
+    ),
+    "Non-finite value": (
+        "Cannot be treated as an ordinary finite measurement and may destabilize "
+        "statistics or model fitting."
+    ),
+    "Below minimum": (
+        "Violates the declared lower bound and may distort downstream analysis."
+    ),
+    "Above maximum": (
+        "Violates the declared upper bound and may distort downstream analysis."
+    ),
+}
 
 
 class ValueValidationError(ValueError):
@@ -112,6 +163,14 @@ class ValueQualityReport:
     def issues_frame(self) -> pd.DataFrame:
         """Return a copy of issue samples and their frequencies."""
         return self.issues.copy(deep=True)
+
+    def issues_with_impacts_frame(self) -> pd.DataFrame:
+        """Return issue samples enriched with generic analytical impacts."""
+        frame = self.issues.copy(deep=True)
+        frame["Potential analytical impact"] = frame["Issue"].map(
+            _ISSUE_IMPACTS
+        )
+        return frame
 
     def summary_frame(self) -> pd.DataFrame:
         """Return deterministic counts grouped by validation status."""
@@ -184,6 +243,75 @@ class ValueQualityReport:
         return bool((observed > 0).any())
 
 
+def analyze_source_backed_missing_and_invalid_values(
+    dataframe: pd.DataFrame,
+    *,
+    source_variables_file: str | Path,
+    target: str,
+    expected_target_values: Sequence[object],
+    max_issue_samples: int = 10,
+) -> ValueQualityReport:
+    """Analyze value quality using source types and the target contract.
+
+    The source-variable table provides structural type semantics, while the
+    notebook-supplied target contract provides the only finite categorical
+    domain enforced here. Numeric range/domain rules remain the responsibility
+    of the preceding domain-validation stage.
+    """
+    if not isinstance(dataframe, pd.DataFrame):
+        raise TypeError("dataframe must be a pandas DataFrame.")
+
+    target_name = _normalize_column_name(target)
+    if target_name not in dataframe.columns:
+        raise KeyError(f"Target column not found: {target_name!r}")
+
+    target_values = tuple(expected_target_values)
+    if not target_values:
+        raise ValueValidationError(
+            "expected_target_values must contain at least one target value."
+        )
+
+    source_rows = _load_source_variable_rows(source_variables_file)
+    dataset_columns = tuple(str(column) for column in dataframe.columns)
+    _validate_source_variable_coverage(dataset_columns, source_rows)
+
+    rules: dict[str, dict[str, object]] = {}
+    for column in dataset_columns:
+        source_type = source_rows[column].casefold()
+        rule: dict[str, object] = {
+            "required": True,
+            "allow_blank": False,
+        }
+
+        if source_type in _SOURCE_NUMERIC_TYPES:
+            rule["numeric"] = True
+            rule["finite"] = True
+            if source_type in _SOURCE_INTEGER_TYPES:
+                rule["integer"] = True
+        elif source_type not in _SOURCE_TEXT_TYPES:
+            raise ValueValidationError(
+                f"Unsupported source variable type for {column!r}: "
+                f"{source_rows[column]!r}."
+            )
+
+        if column == target_name:
+            rule.update(
+                {
+                    "allowed_values": target_values,
+                    "strip_strings": True,
+                    "case_sensitive": True,
+                }
+            )
+
+        rules[column] = rule
+
+    return analyze_missing_and_invalid_values(
+        dataframe,
+        rules,
+        max_issue_samples=max_issue_samples,
+    )
+
+
 def analyze_missing_and_invalid_values(
     dataframe: pd.DataFrame,
     rules: Mapping[str, RuleSpec],
@@ -199,6 +327,7 @@ def analyze_missing_and_invalid_values(
     - ``allowed_values``: finite domain of accepted values;
     - ``numeric``: non-blank values must be numerically parseable;
     - ``integer``: numerically parseable values must be whole numbers;
+    - ``finite``: numeric values must exclude positive/negative infinity;
     - ``minimum`` and ``maximum``: inclusive numeric limits;
     - ``strip_strings``: trimmed variants are classified as inconsistent;
     - ``case_sensitive``: case variants are classified as inconsistent when
@@ -326,6 +455,13 @@ def _analyze_column(
         invalid_masks.append(("Non-numeric value", non_numeric_mask))
 
         valid_numeric_mask = candidate_mask & numeric_values.notna()
+
+        if rule["finite"]:
+            finite_mask = numeric_values.map(
+                lambda value: bool(pd.notna(value) and isfinite(float(value)))
+            )
+            non_finite_mask = valid_numeric_mask & ~finite_mask
+            invalid_masks.append(("Non-finite value", non_finite_mask))
 
         if rule["integer"]:
             non_integer_mask = valid_numeric_mask & (
@@ -467,6 +603,79 @@ def _issue_value_rows(
     ]
 
 
+def _load_source_variable_rows(
+    source_variables_file: str | Path,
+) -> dict[str, str]:
+    path = Path(source_variables_file).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Source variables metadata file not found: {path}"
+        )
+
+    try:
+        variables = pd.read_csv(path)
+    except (OSError, pd.errors.ParserError) as exc:
+        raise ValueValidationError(
+            "Could not read the source variables metadata table."
+        ) from exc
+
+    normalized_columns = {
+        str(column).strip().casefold(): str(column)
+        for column in variables.columns
+    }
+    name_column = normalized_columns.get("name")
+    type_column = normalized_columns.get("type")
+    if name_column is None or type_column is None:
+        raise ValueValidationError(
+            "Source variables metadata must contain 'name' and 'type' columns."
+        )
+
+    rows: dict[str, str] = {}
+    for _, row in variables.iterrows():
+        name = _normalize_column_name(str(row[name_column]))
+        if name in rows:
+            raise ValueValidationError(
+                f"Source variables metadata describes {name!r} more than once."
+            )
+        source_type = str(row[type_column]).strip()
+        if not source_type or source_type.casefold() == "nan":
+            raise ValueValidationError(
+                f"Source variable type is missing for {name!r}."
+            )
+        rows[name] = source_type
+
+    return rows
+
+
+def _validate_source_variable_coverage(
+    dataset_columns: tuple[str, ...],
+    source_rows: Mapping[str, str],
+) -> None:
+    if len(set(dataset_columns)) != len(dataset_columns):
+        raise ValueValidationError(
+            "Dataset columns must be unique before value-quality analysis."
+        )
+
+    dataset_set = set(dataset_columns)
+    source_set = set(source_rows)
+    missing = [column for column in dataset_columns if column not in source_set]
+    extra = [column for column in source_rows if column not in dataset_set]
+
+    failures: list[str] = []
+    if missing:
+        failures.append(
+            "dataset columns missing from source variable metadata: "
+            + ", ".join(missing)
+        )
+    if extra:
+        failures.append(
+            "source variable metadata contains columns absent from dataset: "
+            + ", ".join(extra)
+        )
+    if failures:
+        raise ValueValidationError("; ".join(failures) + ".")
+
+
 def _normalize_rules(
     rules: Mapping[str, RuleSpec],
 ) -> dict[str, dict[str, object]]:
@@ -518,6 +727,11 @@ def _normalize_rules(
             field="integer",
             column=column,
         )
+        finite = _normalize_boolean(
+            raw_rule.get("finite", False),
+            field="finite",
+            column=column,
+        )
         strip_strings = _normalize_boolean(
             raw_rule.get("strip_strings", False),
             field="strip_strings",
@@ -546,6 +760,11 @@ def _normalize_rules(
 
         if integer:
             numeric = True
+        if finite and not numeric:
+            raise ValueError(
+                f"Validation rule for '{column}' enables 'finite' "
+                "without enabling 'numeric'."
+            )
         if (minimum is not None or maximum is not None) and not numeric:
             raise ValueError(
                 f"Validation rule for '{column}' defines numeric limits "
@@ -563,6 +782,7 @@ def _normalize_rules(
             "allowed_values": allowed_values,
             "numeric": numeric,
             "integer": integer,
+            "finite": finite,
             "minimum": minimum,
             "maximum": maximum,
             "strip_strings": strip_strings,

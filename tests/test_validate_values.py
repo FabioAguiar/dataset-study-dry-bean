@@ -8,6 +8,7 @@ import pytest
 from scripts.validate_values import (
     ValueValidationError,
     analyze_missing_and_invalid_values,
+    analyze_source_backed_missing_and_invalid_values,
 )
 
 
@@ -344,3 +345,99 @@ def test_analysis_and_report_frames_do_not_modify_inputs() -> None:
     assert rules == original_rules
     assert report.column_frame().loc[0, "Status"] == "Review required"
     assert report.issues_frame().loc[0, "Issue"] == "Non-numeric value"
+
+
+
+def test_source_backed_analysis_derives_rules_from_metadata_and_target_contract(
+    tmp_path,
+) -> None:
+    dataframe = pd.DataFrame(
+        {
+            "Area": [100, 101, 102],
+            "Perimeter": [40.5, float("inf"), 42.0],
+            "Class": ["SEKER", " SEKER ", None],
+        }
+    )
+    variables_file = tmp_path / "variables.csv"
+    pd.DataFrame(
+        {
+            "name": ["Area", "Perimeter", "Class"],
+            "type": ["Integer", "Continuous", "Categorical"],
+        }
+    ).to_csv(variables_file, index=False)
+
+    report = analyze_source_backed_missing_and_invalid_values(
+        dataframe,
+        source_variables_file=variables_file,
+        target="Class",
+        expected_target_values=("SEKER", "BARBUNYA"),
+    )
+
+    checks = report.column_frame().set_index("Column")
+    assert checks.loc["Area", "Status"] == "Valid"
+    assert checks.loc["Perimeter", "Invalid count"] == 1
+    assert checks.loc["Perimeter", "Issue types"] == "Non-finite value"
+    assert checks.loc["Class", "Missing count"] == 1
+    assert checks.loc["Class", "Inconsistent count"] == 1
+    assert checks.loc["Class", "Affected count"] == 2
+
+    issues = report.issues_with_impacts_frame()
+    assert set(issues["Issue"]) == {
+        "Non-finite value",
+        "Inconsistent text",
+        "Missing value",
+    }
+    assert issues["Potential analytical impact"].notna().all()
+
+
+def test_source_backed_analysis_requires_exact_metadata_coverage(tmp_path) -> None:
+    dataframe = pd.DataFrame({"Area": [100], "Class": ["SEKER"]})
+    variables_file = tmp_path / "variables.csv"
+    pd.DataFrame(
+        {
+            "name": ["Area", "Class", "Extra"],
+            "type": ["Integer", "Categorical", "Continuous"],
+        }
+    ).to_csv(variables_file, index=False)
+
+    with pytest.raises(
+        ValueValidationError,
+        match="metadata contains columns absent from dataset: Extra",
+    ):
+        analyze_source_backed_missing_and_invalid_values(
+            dataframe,
+            source_variables_file=variables_file,
+            target="Class",
+            expected_target_values=("SEKER", "BARBUNYA"),
+        )
+
+
+def test_finite_rule_rejects_infinities_without_reclassifying_missing() -> None:
+    dataframe = pd.DataFrame({"value": [1.0, float("inf"), float("-inf"), None]})
+
+    report = analyze_missing_and_invalid_values(
+        dataframe,
+        {
+            "value": {
+                "required": True,
+                "numeric": True,
+                "finite": True,
+            }
+        },
+    )
+
+    checks = report.column_frame().iloc[0]
+    assert checks["Missing count"] == 1
+    assert checks["Invalid count"] == 3
+    assert checks["Affected count"] == 3
+    assert checks["Issue types"] == "Missing value, Non-finite value"
+
+
+def test_finite_rule_requires_numeric_validation() -> None:
+    dataframe = pd.DataFrame({"value": [1.0]})
+
+    with pytest.raises(ValueError, match="enables 'finite'.*without enabling 'numeric'"):
+        analyze_missing_and_invalid_values(
+            dataframe,
+            {"value": {"finite": True}},
+        )
