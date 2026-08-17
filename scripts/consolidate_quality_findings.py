@@ -347,6 +347,55 @@ class InitialDataQualityReport:
             ).any()
         )
 
+    def quality_overview_frame(self) -> pd.DataFrame:
+        """Return a compact quality-only overview without modeling clearance."""
+        if self.findings.empty:
+            open_count = 0
+            blocking_count = 0
+        else:
+            unresolved = self.findings["Status"].isin(_OPEN_STATUSES)
+            open_count = int(unresolved.sum())
+            blocking_count = int(
+                (
+                    unresolved
+                    & self.findings["Blocking scope"].ne("None")
+                ).sum()
+            )
+
+        rows = [
+            {
+                "Metric": "Dataset rows",
+                "Value": self.row_count,
+                "Interpretation": "Rows represented by the consolidated audit",
+            },
+            {
+                "Metric": "Consolidated findings",
+                "Value": len(self.findings),
+                "Interpretation": "Conditions requiring review or resolution",
+            },
+            {
+                "Metric": "Open or review findings",
+                "Value": open_count,
+                "Interpretation": "Findings still open, monitored, or under review",
+            },
+            {
+                "Metric": "Blocking findings",
+                "Value": blocking_count,
+                "Interpretation": "Unresolved findings with a declared blocking scope",
+            },
+            {
+                "Metric": "Validated non-issues",
+                "Value": len(self.validated_non_issues),
+                "Interpretation": "Conditions protected from unnecessary cleaning",
+            },
+            {
+                "Metric": "Structural consolidation valid",
+                "Value": self.is_structurally_valid,
+                "Interpretation": "Finding and evidence references are coherent",
+            },
+        ]
+        return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
+
     def summary_frame(self) -> pd.DataFrame:
         """Return deterministic counts and readiness indicators."""
         severity_counts = self.findings["Severity"].value_counts()
@@ -635,6 +684,7 @@ def consolidate_initial_data_quality_findings(
     evidence: Sequence[Mapping[str, object]],
     preparation_actions: Sequence[Mapping[str, object]],
     validated_non_issues: Sequence[Mapping[str, object]] = (),
+    validate_action_links: bool = True,
 ) -> InitialDataQualityReport:
     """Normalize and validate initial data-quality findings and actions."""
     fields = tuple(str(value) for value in available_fields)
@@ -665,6 +715,7 @@ def consolidate_initial_data_quality_findings(
             findings_frame,
             evidence_frame,
             action_frame,
+            require_action_links=validate_action_links,
         )
     )
 
@@ -689,6 +740,744 @@ def consolidate_initial_data_quality_findings(
         issues=issues_frame,
     )
 
+
+def consolidate_initial_data_quality_from_reports(
+    *,
+    available_fields: Sequence[str],
+    row_count: int,
+    domain_report: object,
+    value_quality_report: object,
+    duplicate_report: object,
+    target_report: object,
+    numerical_report: object,
+    leakage_report: object,
+) -> InitialDataQualityReport:
+    """Consolidate previously computed quality reports without recomputation.
+
+    Analytical stages remain responsible for detecting conditions. This layer
+    translates their existing evidence into a stable findings/non-issues
+    contract. Preparation actions are intentionally left empty so a later
+    preparation-decision stage can define them explicitly.
+    """
+    fields = tuple(str(value) for value in available_fields)
+    findings: list[dict[str, object]] = []
+    evidence: list[dict[str, object]] = []
+    non_issues: list[dict[str, object]] = []
+
+    def known_fields(values: Sequence[object]) -> tuple[str, ...]:
+        available = set(fields)
+        return tuple(
+            dict.fromkeys(
+                str(value)
+                for value in values
+                if str(value) in available
+            )
+        )
+
+    def add_finding(
+        *,
+        finding_id: str,
+        domain: str,
+        title: str,
+        affected_fields: Sequence[object] = (),
+        severity: str,
+        status: str,
+        disposition: str,
+        blocking_scope: str,
+        source_stages: Sequence[str],
+        required_action: str,
+        verification: str,
+        evidence_rows: Sequence[tuple[str, str, object, object, str]],
+    ) -> None:
+        findings.append(
+            {
+                "finding_id": finding_id,
+                "domain": domain,
+                "title": title,
+                "affected_fields": known_fields(affected_fields),
+                "severity": severity,
+                "status": status,
+                "disposition": disposition,
+                "blocking_scope": blocking_scope,
+                "source_stages": tuple(source_stages),
+                "required_action": required_action,
+                "verification": verification,
+            }
+        )
+        for position, row in enumerate(evidence_rows, start=1):
+            source_report, source_metric, observed, expected, interpretation = row
+            evidence.append(
+                {
+                    "evidence_id": f"{finding_id}-E{position:02d}",
+                    "finding_id": finding_id,
+                    "source_report": source_report,
+                    "source_metric": source_metric,
+                    "observed_value": observed,
+                    "expected_value": expected,
+                    "interpretation": interpretation,
+                }
+            )
+
+    def add_non_issue(
+        *,
+        non_issue_id: str,
+        domain: str,
+        title: str,
+        affected_fields: Sequence[object] = (),
+        source_stages: Sequence[str],
+        evidence_text: str,
+        disposition: str,
+        interpretation: str,
+    ) -> None:
+        non_issues.append(
+            {
+                "non_issue_id": non_issue_id,
+                "domain": domain,
+                "title": title,
+                "affected_fields": known_fields(affected_fields),
+                "source_stages": tuple(source_stages),
+                "evidence": evidence_text,
+                "disposition": disposition,
+                "interpretation": interpretation,
+            }
+        )
+
+    # Stage 7: source-backed types and declared domain rules.
+    type_mismatches = tuple(
+        getattr(domain_report, "type_mismatch_columns", ())
+    )
+    domain_violations = tuple(
+        getattr(domain_report, "domain_violation_columns", ())
+    )
+    violated_relations = tuple(
+        getattr(domain_report, "violated_relations", ())
+    )
+    if type_mismatches or domain_violations or violated_relations:
+        add_finding(
+            finding_id="DQ-001",
+            domain="Schema and domain validity",
+            title="Source-backed type or domain constraints require resolution",
+            affected_fields=(*type_mismatches, *domain_violations),
+            severity="High",
+            status="Open",
+            disposition="Must fix",
+            blocking_scope="Preparation",
+            source_stages=("7",),
+            required_action=(
+                "Resolve every source-type mismatch and declared domain "
+                "violation before constructing prepared model inputs."
+            ),
+            verification=(
+                "The type/domain audit reports zero mismatched columns, zero "
+                "domain-violation columns, and zero violated relations."
+            ),
+            evidence_rows=(
+                (
+                    "domain_report",
+                    "Type mismatches",
+                    len(type_mismatches),
+                    0,
+                    "Observed dtypes must satisfy source-backed semantic types.",
+                ),
+                (
+                    "domain_report",
+                    "Columns with domain violations",
+                    len(domain_violations),
+                    0,
+                    "Declared per-column domain rules must hold.",
+                ),
+                (
+                    "domain_report",
+                    "Relations with violations",
+                    len(violated_relations),
+                    0,
+                    "Declared cross-column physical relations must hold.",
+                ),
+            ),
+        )
+    else:
+        add_non_issue(
+            non_issue_id="NI-001",
+            domain="Schema and domain validity",
+            title="Source-backed types and declared domains are satisfied",
+            source_stages=("7",),
+            evidence_text=(
+                "No type mismatch, column-domain violation, or declared "
+                "cross-column relation violation was reported."
+            ),
+            disposition="No action",
+            interpretation=(
+                "Do not introduce corrective coercions without new evidence."
+            ),
+        )
+
+    # Stage 8: missing, blank, inconsistent, and invalid values.
+    value_checks = value_quality_report.column_frame()
+    count_columns = (
+        "Missing count",
+        "Blank count",
+        "Inconsistent count",
+        "Invalid count",
+    )
+    issue_counts = {
+        column: (
+            int(
+                pd.to_numeric(
+                    value_checks[column],
+                    errors="coerce",
+                ).fillna(0).sum()
+            )
+            if column in value_checks.columns
+            else 0
+        )
+        for column in count_columns
+    }
+    if bool(getattr(value_quality_report, "has_issues", False)):
+        add_finding(
+            finding_id="DQ-002",
+            domain="Value quality",
+            title="Missing or invalid values require deterministic preparation rules",
+            affected_fields=getattr(
+                value_quality_report,
+                "affected_columns",
+                (),
+            ),
+            severity="High",
+            status="Open",
+            disposition="Must fix",
+            blocking_scope="Preparation",
+            source_stages=("8",),
+            required_action=(
+                "Define evidence-backed handling for each affected field; do "
+                "not silently drop or impute observations."
+            ),
+            verification=(
+                "The prepared projection passes the same value-quality rules "
+                "with zero unresolved value issues."
+            ),
+            evidence_rows=tuple(
+                (
+                    "value_quality_report",
+                    column,
+                    count,
+                    0,
+                    "Observed issue count from the source-backed value audit.",
+                )
+                for column, count in issue_counts.items()
+            ),
+        )
+    else:
+        add_non_issue(
+            non_issue_id="NI-002",
+            domain="Value quality",
+            title="No missing, blank, inconsistent, or invalid values were detected",
+            affected_fields=fields,
+            source_stages=("8",),
+            evidence_text=(
+                "All dataset columns passed the source-backed value-quality rules."
+            ),
+            disposition="No action",
+            interpretation=(
+                "Do not add imputation or value-repair steps without new evidence."
+            ),
+        )
+
+    # Stage 9: duplicate and repeated-profile evidence.
+    has_source_identifiers = bool(
+        getattr(duplicate_report, "has_source_identifiers", False)
+    )
+    has_exact_duplicates = bool(
+        getattr(duplicate_report, "has_exact_duplicates", False)
+    )
+    has_duplicate_identifiers = bool(
+        getattr(duplicate_report, "has_duplicate_identifiers", False)
+    )
+    has_conflicting_identifiers = bool(
+        getattr(duplicate_report, "has_conflicting_identifiers", False)
+    )
+    has_target_conflicts = bool(
+        getattr(duplicate_report, "has_target_conflicts", False)
+    )
+
+    if has_source_identifiers and (
+        has_exact_duplicates
+        or has_duplicate_identifiers
+        or has_conflicting_identifiers
+    ):
+        add_finding(
+            finding_id="DQ-003",
+            domain="Record integrity",
+            title="Source-backed duplicate identity requires resolution",
+            affected_fields=getattr(
+                duplicate_report,
+                "identifier_columns",
+                (),
+            ),
+            severity="High",
+            status="Open",
+            disposition="Must fix",
+            blocking_scope="Preparation",
+            source_stages=("9",),
+            required_action=(
+                "Resolve duplicate source identities before splitting or training."
+            ),
+            verification=(
+                "Source identifiers are unique and conflict-free after preparation."
+            ),
+            evidence_rows=(
+                (
+                    "duplicate_report",
+                    "Exact duplicate rows",
+                    int(
+                        getattr(
+                            duplicate_report,
+                            "exact_duplicate_row_count",
+                            0,
+                        )
+                    ),
+                    0,
+                    "Exact equality is actionable when source identity exists.",
+                ),
+                (
+                    "duplicate_report",
+                    "Duplicate identifier rows",
+                    int(
+                        getattr(
+                            duplicate_report,
+                            "duplicate_identifier_row_count",
+                            0,
+                        )
+                    ),
+                    0,
+                    "Source-backed identifiers should not repeat.",
+                ),
+                (
+                    "duplicate_report",
+                    "Conflicting identifier rows",
+                    int(
+                        getattr(
+                            duplicate_report,
+                            "conflicting_identifier_row_count",
+                            0,
+                        )
+                    ),
+                    0,
+                    "Repeated identifiers must not carry contradictory content.",
+                ),
+            ),
+        )
+    elif not has_source_identifiers and has_exact_duplicates:
+        add_finding(
+            finding_id="DQ-003",
+            domain="Record integrity",
+            title="Exact row matches require review because source identity is unavailable",
+            severity="Medium",
+            status="Review",
+            disposition="Monitor",
+            blocking_scope="None",
+            source_stages=("9",),
+            required_action=(
+                "Preserve exact row matches unless independent evidence proves "
+                "that they represent duplicated observations."
+            ),
+            verification=(
+                "Any later deduplication decision cites source-identity evidence; "
+                "row equality alone is not used as a deletion rule."
+            ),
+            evidence_rows=(
+                (
+                    "duplicate_report",
+                    "Exact duplicate groups",
+                    int(
+                        getattr(
+                            duplicate_report,
+                            "exact_duplicate_group_count",
+                            0,
+                        )
+                    ),
+                    "Review only",
+                    "The dataset does not provide source identifiers for grains.",
+                ),
+                (
+                    "duplicate_report",
+                    "Exact duplicate rows",
+                    int(
+                        getattr(
+                            duplicate_report,
+                            "exact_duplicate_row_count",
+                            0,
+                        )
+                    ),
+                    "Review only",
+                    "Exact equality cannot establish repeated physical identity.",
+                ),
+            ),
+        )
+    else:
+        add_non_issue(
+            non_issue_id="NI-003",
+            domain="Record integrity",
+            title="No duplicate condition supports deterministic row removal",
+            source_stages=("9",),
+            evidence_text=(
+                "The duplicate audit found no source-backed condition that "
+                "justifies automatic row deletion."
+            ),
+            disposition="Preserve",
+            interpretation=(
+                "Preserve source rows unless stronger identity evidence emerges."
+            ),
+        )
+
+    if has_target_conflicts:
+        add_finding(
+            finding_id="DQ-004",
+            domain="Record ambiguity",
+            title="Identical feature profiles occur with different target classes",
+            severity="Medium",
+            status="Review",
+            disposition="Evaluate",
+            blocking_scope="Model evaluation",
+            source_stages=("9",),
+            required_action=(
+                "Retain the records and quantify their effect during multiclass "
+                "error analysis; do not relabel them without source evidence."
+            ),
+            verification=(
+                "Model evaluation documents whether conflicting repeated profiles "
+                "contribute to irreducible classification ambiguity."
+            ),
+            evidence_rows=(
+                (
+                    "duplicate_report",
+                    "Target-conflict profile groups",
+                    int(
+                        getattr(
+                            duplicate_report,
+                            "target_conflict_group_count",
+                            0,
+                        )
+                    ),
+                    0,
+                    "Identical predictors mapping to multiple classes are ambiguous.",
+                ),
+                (
+                    "duplicate_report",
+                    "Target-conflict rows",
+                    int(
+                        getattr(
+                            duplicate_report,
+                            "target_conflict_row_count",
+                            0,
+                        )
+                    ),
+                    0,
+                    "Affected rows should remain traceable for error analysis.",
+                ),
+            ),
+        )
+
+    # Stage 10: target integrity and class support.
+    target_name = str(getattr(target_report, "target", ""))
+    target_fields = (target_name,) if target_name in set(fields) else ()
+    if bool(getattr(target_report, "has_issues", False)):
+        add_finding(
+            finding_id="DQ-005",
+            domain="Target integrity",
+            title="Multiclass target contract is not satisfied",
+            affected_fields=target_fields,
+            severity="Critical",
+            status="Open",
+            disposition="Must fix",
+            blocking_scope="Modeling clearance",
+            source_stages=("10",),
+            required_action=(
+                "Resolve missing target values and any missing or unexpected "
+                "class labels before modeling."
+            ),
+            verification=(
+                "The target audit contains every declared class, no unexpected "
+                "class, and no missing target value."
+            ),
+            evidence_rows=(
+                (
+                    "target_report",
+                    "Missing target values",
+                    int(getattr(target_report, "missing_count", 0)),
+                    0,
+                    "Supervised rows require a valid multiclass label.",
+                ),
+                (
+                    "target_report",
+                    "Missing expected classes",
+                    len(
+                        getattr(
+                            target_report,
+                            "missing_expected_classes",
+                            (),
+                        )
+                    ),
+                    0,
+                    "Every declared class must be represented.",
+                ),
+                (
+                    "target_report",
+                    "Unexpected classes",
+                    len(getattr(target_report, "unexpected_classes", ())),
+                    0,
+                    "Observed labels must remain inside the target contract.",
+                ),
+            ),
+        )
+    else:
+        add_non_issue(
+            non_issue_id="NI-004",
+            domain="Target integrity",
+            title="The multiclass target contract is complete and valid",
+            affected_fields=target_fields,
+            source_stages=("10",),
+            evidence_text=(
+                f"Observed classes: {int(getattr(target_report, 'class_count', 0))}; "
+                "no missing or unexpected target values were reported."
+            ),
+            disposition="No action",
+            interpretation="Preserve the readable nominal class labels.",
+        )
+
+    imbalance_ratio = getattr(target_report, "imbalance_ratio", None)
+    normalized_entropy = getattr(
+        target_report,
+        "normalized_class_entropy",
+        None,
+    )
+    add_non_issue(
+        non_issue_id="NI-005",
+        domain="Target support",
+        title="Unequal class support is a modeling condition, not a data-quality defect",
+        affected_fields=target_fields,
+        source_stages=("10",),
+        evidence_text=(
+            "Majority-to-minority ratio="
+            f"{imbalance_ratio if imbalance_ratio is not None else 'not available'}; "
+            "normalized class entropy="
+            f"{normalized_entropy if normalized_entropy is not None else 'not available'}."
+        ),
+        disposition="Monitor",
+        interpretation=(
+            "Preserve all classes and carry class-support evidence into "
+            "stratified splitting and multiclass evaluation."
+        ),
+    )
+
+    # Stage 11: statistical outlier candidates.
+    outlier_features = tuple(
+        str(value)
+        for value in getattr(
+            numerical_report,
+            "features_with_outliers",
+            (),
+        )
+    )
+    if bool(getattr(numerical_report, "has_outliers", False)):
+        outlier_summary = numerical_report.outlier_summary_frame()
+        outlier_count = (
+            int(
+                pd.to_numeric(
+                    outlier_summary["Outlier count"],
+                    errors="coerce",
+                ).fillna(0).sum()
+            )
+            if "Outlier count" in outlier_summary.columns
+            else 0
+        )
+        add_non_issue(
+            non_issue_id="NI-006",
+            domain="Numerical distribution",
+            title="IQR outlier candidates are not automatically invalid observations",
+            affected_fields=outlier_features,
+            source_stages=("11",),
+            evidence_text=(
+                f"{len(outlier_features)} feature(s) contain {outlier_count} "
+                "feature-level IQR candidate occurrences."
+            ),
+            disposition="Preserve",
+            interpretation=(
+                "Do not remove, clip, or winsorize observations solely because "
+                "the IQR rule flags them."
+            ),
+        )
+    else:
+        add_non_issue(
+            non_issue_id="NI-006",
+            domain="Numerical distribution",
+            title="No IQR outlier candidates were detected",
+            source_stages=("11",),
+            evidence_text=(
+                "The configured IQR rule reported zero candidate outliers."
+            ),
+            disposition="No action",
+            interpretation=(
+                "No outlier treatment is justified by the exploratory rule."
+            ),
+        )
+
+    # Stage 15: static target leakage and feature provenance.
+    proxy_frame = leakage_report.target_proxy_candidates_frame()
+    dependency_frame = leakage_report.dependency_frame()
+    if bool(getattr(leakage_report, "has_direct_target_leakage", False)):
+        proxy_fields = (
+            tuple(str(value) for value in proxy_frame["Field"])
+            if "Field" in proxy_frame.columns
+            else ()
+        )
+        target_derived_fields = (
+            tuple(
+                str(value)
+                for value in dependency_frame.loc[
+                    dependency_frame["Target-derived"].astype(bool),
+                    "Derived feature",
+                ]
+            )
+            if {
+                "Target-derived",
+                "Derived feature",
+            }.issubset(dependency_frame.columns)
+            else ()
+        )
+        add_finding(
+            finding_id="DQ-006",
+            domain="Leakage governance",
+            title="Direct or deterministic target leakage was detected",
+            affected_fields=(*proxy_fields, *target_derived_fields),
+            severity="Critical",
+            status="Open",
+            disposition="Prohibited",
+            blocking_scope="Modeling clearance",
+            source_stages=("15",),
+            required_action=(
+                "Exclude every target proxy or target-derived predictor before "
+                "any split or model fit."
+            ),
+            verification=(
+                "The static leakage audit reports zero target proxies, zero "
+                "target-derived dependencies, and target isolation."
+            ),
+            evidence_rows=(
+                (
+                    "leakage_report",
+                    "Target proxy candidates",
+                    len(proxy_frame),
+                    0,
+                    "Candidate predictors must not deterministically encode target.",
+                ),
+                (
+                    "leakage_report",
+                    "Target-derived dependencies",
+                    int(
+                        getattr(
+                            leakage_report,
+                            "has_target_derived_dependencies",
+                            False,
+                        )
+                    ),
+                    0,
+                    "Derived predictors must not use the response variable.",
+                ),
+            ),
+        )
+    else:
+        add_non_issue(
+            non_issue_id="NI-007",
+            domain="Leakage governance",
+            title="No direct or deterministic target leakage was detected",
+            affected_fields=getattr(
+                leakage_report,
+                "candidate_features",
+                (),
+            ),
+            source_stages=("15",),
+            evidence_text=(
+                "The target is excluded from candidate predictors and no "
+                "deterministic target proxy or target-derived dependency was detected."
+            ),
+            disposition="No action",
+            interpretation=(
+                "Preserve target isolation in every downstream predictor matrix."
+            ),
+        )
+
+    if not dependency_frame.empty and "Dependency status" in dependency_frame.columns:
+        unconfirmed = dependency_frame.loc[
+            dependency_frame["Dependency status"].eq(
+                "Declared dependency not confirmed"
+            )
+        ]
+        if not unconfirmed.empty:
+            add_finding(
+                finding_id="DQ-007",
+                domain="Derived-feature provenance",
+                title="Declared mathematical dependencies require review",
+                affected_fields=tuple(unconfirmed["Derived feature"]),
+                severity="Medium",
+                status="Review",
+                disposition="Evaluate",
+                blocking_scope="Model evaluation",
+                source_stages=("15",),
+                required_action=(
+                    "Review source definitions and tolerances before relying on "
+                    "unconfirmed formulas for redundancy decisions."
+                ),
+                verification=(
+                    "Each dependency is either numerically confirmed or explicitly "
+                    "documented as requiring an unavailable primitive."
+                ),
+                evidence_rows=(
+                    (
+                        "leakage_report",
+                        "Unconfirmed derived dependencies",
+                        len(unconfirmed),
+                        0,
+                        "Unconfirmed formulas must not be treated as proven redundancy.",
+                    ),
+                ),
+            )
+        else:
+            confirmed = dependency_frame.loc[
+                dependency_frame["Dependency status"].eq(
+                    "Confirmed from retained columns"
+                )
+            ]
+            external = dependency_frame.loc[
+                dependency_frame["Dependency status"].eq(
+                    "Documented; source column not retained"
+                )
+            ]
+            add_non_issue(
+                non_issue_id="NI-008",
+                domain="Derived-feature provenance",
+                title="Derived-feature dependencies are structural redundancy, not leakage",
+                affected_fields=tuple(dependency_frame["Derived feature"]),
+                source_stages=("15",),
+                evidence_text=(
+                    f"Confirmed retained dependencies: {len(confirmed)}; "
+                    f"documented external-source dependencies: {len(external)}."
+                ),
+                disposition="Monitor",
+                interpretation=(
+                    "Carry redundancy evidence into later modeling comparisons; "
+                    "do not remove derived features automatically during exploration."
+                ),
+            )
+
+    return consolidate_initial_data_quality_findings(
+        available_fields=fields,
+        row_count=row_count,
+        findings=findings,
+        evidence=evidence,
+        preparation_actions=(),
+        validated_non_issues=non_issues,
+        validate_action_links=False,
+    )
 
 def _normalize_findings(
     declarations: Sequence[Mapping[str, object]],
@@ -1023,6 +1812,8 @@ def _reference_issues(
     findings: pd.DataFrame,
     evidence: pd.DataFrame,
     actions: pd.DataFrame,
+    *,
+    require_action_links: bool = True,
 ) -> list[dict[str, object]]:
     issues: list[dict[str, object]] = []
     finding_ids = set(findings["Finding ID"].astype(str))
@@ -1066,24 +1857,25 @@ def _reference_issues(
                 )
             )
 
-    actionable = findings.loc[
-        findings["Disposition"].isin(_ACTION_REQUIRED_DISPOSITIONS)
-    ]
-    linked_action_ids: set[str] = set()
-    for finding_ids in actions["Finding IDs"]:
-        linked_action_ids.update(str(value) for value in finding_ids)
+    if require_action_links:
+        actionable = findings.loc[
+            findings["Disposition"].isin(_ACTION_REQUIRED_DISPOSITIONS)
+        ]
+        linked_action_ids: set[str] = set()
+        for finding_ids in actions["Finding IDs"]:
+            linked_action_ids.update(str(value) for value in finding_ids)
 
-    for finding_id in actionable["Finding ID"].astype(str):
-        if finding_id not in linked_action_ids:
-            issues.append(
-                _issue(
-                    "Finding",
-                    finding_id,
-                    "Actionable finding without action",
-                    "No preparation action references this finding",
-                    "The preparation scope is incomplete",
+        for finding_id in actionable["Finding ID"].astype(str):
+            if finding_id not in linked_action_ids:
+                issues.append(
+                    _issue(
+                        "Finding",
+                        finding_id,
+                        "Actionable finding without action",
+                        "No preparation action references this finding",
+                        "The preparation scope is incomplete",
+                    )
                 )
-            )
 
     return issues
 

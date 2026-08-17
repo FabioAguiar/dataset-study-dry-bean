@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from scripts.consolidate_quality_findings import (
     InitialDataQualityConsolidationError,
     consolidate_initial_data_quality_findings,
+    consolidate_initial_data_quality_from_reports,
 )
 
 
@@ -548,3 +550,191 @@ def test_no_findings_is_structurally_valid_and_modeling_ready() -> None:
     assert report.is_safe_preparation_scope_defined
     assert report.is_modeling_ready
     assert report.blockers_frame().empty
+
+
+
+def _source_backed_report_inputs(**overrides):
+    value_checks = pd.DataFrame(
+        {
+            "Column": ["Area", "Perimeter", "Class"],
+            "Missing count": [0, 0, 0],
+            "Blank count": [0, 0, 0],
+            "Inconsistent count": [0, 0, 0],
+            "Invalid count": [0, 0, 0],
+        }
+    )
+    dependency_frame = pd.DataFrame(
+        {
+            "Derived feature": ["Perimeter"],
+            "Target-derived": [False],
+            "Dependency status": ["Confirmed from retained columns"],
+        }
+    )
+    proxy_frame = pd.DataFrame(columns=["Field"])
+
+    parameters = {
+        "available_fields": ("Area", "Perimeter", "Class"),
+        "row_count": 100,
+        "domain_report": SimpleNamespace(
+            type_mismatch_columns=(),
+            domain_violation_columns=(),
+            violated_relations=(),
+        ),
+        "value_quality_report": SimpleNamespace(
+            has_issues=False,
+            affected_columns=(),
+            column_frame=lambda: value_checks.copy(deep=True),
+        ),
+        "duplicate_report": SimpleNamespace(
+            has_source_identifiers=False,
+            has_exact_duplicates=False,
+            has_duplicate_identifiers=False,
+            has_conflicting_identifiers=False,
+            has_target_conflicts=False,
+            identifier_columns=(),
+            exact_duplicate_group_count=0,
+            exact_duplicate_row_count=0,
+            duplicate_identifier_row_count=0,
+            conflicting_identifier_row_count=0,
+            target_conflict_group_count=0,
+            target_conflict_row_count=0,
+        ),
+        "target_report": SimpleNamespace(
+            target="Class",
+            has_issues=False,
+            class_count=3,
+            missing_count=0,
+            missing_expected_classes=(),
+            unexpected_classes=(),
+            imbalance_ratio=1.5,
+            normalized_class_entropy=0.98,
+        ),
+        "numerical_report": SimpleNamespace(
+            has_outliers=True,
+            features_with_outliers=("Area",),
+            outlier_summary_frame=lambda: pd.DataFrame(
+                {
+                    "Feature": ["Area", "Perimeter"],
+                    "Outlier count": [4, 0],
+                }
+            ),
+        ),
+        "leakage_report": SimpleNamespace(
+            has_direct_target_leakage=False,
+            has_target_derived_dependencies=False,
+            candidate_features=("Area", "Perimeter"),
+            target_proxy_candidates_frame=lambda: proxy_frame.copy(deep=True),
+            dependency_frame=lambda: dependency_frame.copy(deep=True),
+        ),
+    }
+    parameters.update(overrides)
+    return consolidate_initial_data_quality_from_reports(**parameters)
+
+
+def test_report_driven_consolidation_keeps_clean_conditions_as_non_issues() -> None:
+    report = _source_backed_report_inputs()
+
+    assert report.is_structurally_valid
+    assert report.findings_frame().empty
+    assert len(report.validated_non_issues_frame()) == 8
+    assert set(report.validated_non_issues_frame()["Non-issue ID"]) == {
+        "NI-001",
+        "NI-002",
+        "NI-003",
+        "NI-004",
+        "NI-005",
+        "NI-006",
+        "NI-007",
+        "NI-008",
+    }
+
+
+def test_report_driven_consolidation_marks_exact_matches_without_ids_as_review() -> None:
+    duplicate_report = SimpleNamespace(
+        has_source_identifiers=False,
+        has_exact_duplicates=True,
+        has_duplicate_identifiers=False,
+        has_conflicting_identifiers=False,
+        has_target_conflicts=False,
+        identifier_columns=(),
+        exact_duplicate_group_count=2,
+        exact_duplicate_row_count=4,
+        duplicate_identifier_row_count=0,
+        conflicting_identifier_row_count=0,
+        target_conflict_group_count=0,
+        target_conflict_row_count=0,
+    )
+
+    report = _source_backed_report_inputs(duplicate_report=duplicate_report)
+    finding = report.findings_frame().set_index("Finding ID").loc["DQ-003"]
+
+    assert report.is_structurally_valid
+    assert finding["Status"] == "Review"
+    assert finding["Disposition"] == "Monitor"
+    assert finding["Blocking scope"] == "None"
+
+
+def test_report_driven_actionable_finding_can_precede_preparation_decisions() -> None:
+    value_checks = pd.DataFrame(
+        {
+            "Column": ["Area", "Perimeter", "Class"],
+            "Missing count": [1, 0, 0],
+            "Blank count": [0, 0, 0],
+            "Inconsistent count": [0, 0, 0],
+            "Invalid count": [0, 0, 0],
+        }
+    )
+    value_quality_report = SimpleNamespace(
+        has_issues=True,
+        affected_columns=("Area",),
+        column_frame=lambda: value_checks.copy(deep=True),
+    )
+
+    report = _source_backed_report_inputs(
+        value_quality_report=value_quality_report,
+    )
+    finding = report.findings_frame().set_index("Finding ID").loc["DQ-002"]
+
+    assert report.is_structurally_valid
+    assert not report.is_safe_preparation_scope_defined
+    assert finding["Disposition"] == "Must fix"
+    report.raise_if_invalid(require_action_for_open_findings=False)
+
+
+def test_report_driven_consolidation_surfaces_target_leakage() -> None:
+    proxy_frame = pd.DataFrame({"Field": ["Area"]})
+    leakage_report = SimpleNamespace(
+        has_direct_target_leakage=True,
+        has_target_derived_dependencies=False,
+        candidate_features=("Area", "Perimeter"),
+        target_proxy_candidates_frame=lambda: proxy_frame.copy(deep=True),
+        dependency_frame=lambda: pd.DataFrame(
+            columns=[
+                "Derived feature",
+                "Target-derived",
+                "Dependency status",
+            ]
+        ),
+    )
+
+    report = _source_backed_report_inputs(leakage_report=leakage_report)
+    finding = report.findings_frame().set_index("Finding ID").loc["DQ-006"]
+
+    assert finding["Severity"] == "Critical"
+    assert finding["Disposition"] == "Prohibited"
+    assert finding["Blocking scope"] == "Modeling clearance"
+    assert finding["Affected fields"] == ("Area",)
+
+
+def test_quality_overview_avoids_premature_modeling_clearance_language() -> None:
+    overview = _source_backed_report_inputs().quality_overview_frame()
+
+    assert list(overview["Metric"]) == [
+        "Dataset rows",
+        "Consolidated findings",
+        "Open or review findings",
+        "Blocking findings",
+        "Validated non-issues",
+        "Structural consolidation valid",
+    ]
+    assert "Modeling ready" not in set(overview["Metric"])
