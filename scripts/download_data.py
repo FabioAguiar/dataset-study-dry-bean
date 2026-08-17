@@ -1,19 +1,21 @@
 """Reusable dataset acquisition helpers for dataset-study repositories.
 
 Study-specific choices such as source identifiers and destination paths are
-intentionally passed by callers. The module supports Kaggle datasets and
-direct HTTP, HTTPS, or FTP file downloads.
+intentionally passed by callers. The module supports UCI ML Repository
+datasets, Kaggle datasets, and direct HTTP, HTTPS, or FTP file downloads.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import shutil
 import sys
 import warnings
+from collections.abc import Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,8 +32,11 @@ SUPPORTED_URL_SCHEMES: Final[frozenset[str]] = frozenset(
 )
 DEFAULT_CHUNK_SIZE: Final[int] = 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS: Final[int] = 120
+DEFAULT_UCI_DATA_FILENAME: Final[str] = "dataset.csv"
+DEFAULT_UCI_METADATA_FILENAME: Final[str] = "metadata.json"
+DEFAULT_UCI_VARIABLES_FILENAME: Final[str] = "variables.csv"
 
-SourceKind = Literal["kaggle", "url"]
+SourceKind = Literal["uci", "kaggle", "url"]
 
 
 class DatasetDownloadError(RuntimeError):
@@ -249,6 +254,182 @@ def _verify_sha256(file_path: Path, expected_sha256: str | None) -> None:
         )
 
 
+
+def _json_compatible(value):
+    """Convert common repository metadata values to JSON-safe structures."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_compatible(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        try:
+            return _json_compatible(item_method())
+        except (TypeError, ValueError):
+            pass
+
+    return str(value)
+
+
+def _materialize_uci_dataset(
+    dataset,
+    destination: Path,
+) -> tuple[Path, Path, Path]:
+    """Persist the UCI tabular import and its descriptive source metadata."""
+    data_path = destination / DEFAULT_UCI_DATA_FILENAME
+    metadata_path = destination / DEFAULT_UCI_METADATA_FILENAME
+    variables_path = destination / DEFAULT_UCI_VARIABLES_FILENAME
+
+    original = getattr(getattr(dataset, "data", None), "original", None)
+    variables = getattr(dataset, "variables", None)
+    metadata = getattr(dataset, "metadata", None)
+
+    if original is None or not hasattr(original, "to_csv"):
+        raise DatasetDownloadError(
+            "ucimlrepo did not return a tabular dataset in data.original."
+        )
+
+    if variables is None or not hasattr(variables, "to_csv"):
+        raise DatasetDownloadError(
+            "ucimlrepo did not return the expected variable metadata table."
+        )
+
+    if metadata is None:
+        raise DatasetDownloadError(
+            "ucimlrepo did not return dataset metadata."
+        )
+
+    temporary_paths = {
+        data_path: data_path.with_name(f".{data_path.name}.part"),
+        metadata_path: metadata_path.with_name(
+            f".{metadata_path.name}.part"
+        ),
+        variables_path: variables_path.with_name(
+            f".{variables_path.name}.part"
+        ),
+    }
+
+    for temporary_path in temporary_paths.values():
+        temporary_path.unlink(missing_ok=True)
+
+    try:
+        original.to_csv(temporary_paths[data_path], index=False)
+        variables.to_csv(temporary_paths[variables_path], index=False)
+        temporary_paths[metadata_path].write_text(
+            json.dumps(
+                _json_compatible(metadata),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        for final_path, temporary_path in temporary_paths.items():
+            os.replace(temporary_path, final_path)
+    except Exception:
+        for temporary_path in temporary_paths.values():
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+    return data_path, metadata_path, variables_path
+
+
+def acquire_uci_dataset(
+    dataset_id: int,
+    destination: str | Path,
+    *,
+    force: bool = False,
+    project_root: str | Path = PROJECT_ROOT,
+) -> DatasetAcquisition:
+    """Fetch a UCI dataset with ``ucimlrepo`` and materialize it locally.
+
+    The official UCI Python client returns pandas dataframes rather than a
+    project-local raw file. This helper persists three immutable acquisition
+    artifacts under the requested raw-data directory: ``dataset.csv``,
+    ``metadata.json``, and ``variables.csv``.
+    """
+    if isinstance(dataset_id, bool) or not isinstance(dataset_id, int):
+        raise TypeError("UCI dataset_id must be an integer.")
+
+    if dataset_id <= 0:
+        raise ValueError("UCI dataset_id must be greater than zero.")
+
+    root = Path(project_root).expanduser().resolve()
+    output_dir = resolve_project_path(destination, project_root=root)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_files = (
+        output_dir / DEFAULT_UCI_DATA_FILENAME,
+        output_dir / DEFAULT_UCI_METADATA_FILENAME,
+        output_dir / DEFAULT_UCI_VARIABLES_FILENAME,
+    )
+    existing = tuple(path.exists() for path in expected_files)
+
+    if all(existing) and not force:
+        return DatasetAcquisition(
+            source_kind="uci",
+            source_reference=f"UCI ML Repository dataset {dataset_id}",
+            destination=output_dir,
+            resolved_path=expected_files[0].resolve(),
+            files=discover_dataset_files(output_dir),
+            project_root=root,
+        )
+
+    if any(existing) and not force:
+        raise DatasetDownloadError(
+            "The UCI raw-data directory contains an incomplete prior "
+            "materialization. Re-run with force=True to replace it."
+        )
+
+    try:
+        from ucimlrepo import fetch_ucirepo
+    except ImportError as exc:
+        raise DatasetDownloadError(
+            "ucimlrepo is not installed in the active Python environment. "
+            "Install the project dependencies with: "
+            "python -m pip install -e ."
+        ) from exc
+
+    try:
+        dataset = fetch_ucirepo(id=dataset_id)
+        data_path, _, _ = _materialize_uci_dataset(
+            dataset,
+            output_dir,
+        )
+    except DatasetDownloadError:
+        raise
+    except Exception as exc:
+        raise DatasetDownloadError(
+            f"UCI acquisition failed for dataset {dataset_id}: {exc}"
+        ) from exc
+
+    files = discover_dataset_files(output_dir)
+
+    if not files:
+        raise DatasetDownloadError(
+            "The UCI acquisition completed but no visible files "
+            "were found in the destination directory."
+        )
+
+    return DatasetAcquisition(
+        source_kind="uci",
+        source_reference=f"UCI ML Repository dataset {dataset_id}",
+        destination=output_dir,
+        resolved_path=data_path.resolve(),
+        files=files,
+        project_root=root,
+    )
+
+
 def download_kaggle_dataset(
     handle: str,
     destination: str | Path,
@@ -295,8 +476,7 @@ def download_kaggle_dataset(
     except ImportError as exc:
         raise DatasetDownloadError(
             "kagglehub is not installed in the active Python environment. "
-            "Install the project dependencies with: "
-            "python -m pip install -e ."
+            "Install kagglehub before using Kaggle acquisition."
         ) from exc
     except TypeError as exc:
         raise DatasetDownloadError(
@@ -492,6 +672,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="source", required=True)
 
+    uci_parser = subparsers.add_parser(
+        "uci",
+        help="Acquire a dataset through the official ucimlrepo client.",
+    )
+    uci_parser.add_argument(
+        "dataset_id",
+        type=int,
+        help="Numeric UCI Machine Learning Repository dataset ID.",
+    )
+    uci_parser.add_argument(
+        "--destination",
+        required=True,
+        help="Project-relative output directory.",
+    )
+    uci_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Fetch again and replace the existing UCI materialization.",
+    )
+
     kaggle_parser = subparsers.add_parser(
         "kaggle",
         help="Acquire a dataset through kagglehub.",
@@ -568,7 +768,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.source == "kaggle":
+        if args.source == "uci":
+            acquisition = acquire_uci_dataset(
+                dataset_id=args.dataset_id,
+                destination=args.destination,
+                force=args.force,
+            )
+        elif args.source == "kaggle":
             acquisition = acquire_kaggle_dataset(
                 handle=args.handle,
                 destination=args.destination,
