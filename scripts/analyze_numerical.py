@@ -58,6 +58,22 @@ _OUTLIER_SUMMARY_COLUMNS: Final[list[str]] = [
     "Interpretation",
 ]
 
+_EXPLORATION_COLUMNS: Final[list[str]] = [
+    "Feature",
+    "Minimum",
+    "Q1",
+    "Median",
+    "Mean",
+    "Q3",
+    "Maximum",
+    "Standard deviation",
+    "IQR",
+    "Skewness",
+    "Distribution shape",
+    "Outlier count",
+    "Outlier percent",
+]
+
 _OUTLIER_COLUMNS: Final[list[str]] = [
     "Feature",
     "Direction",
@@ -238,6 +254,61 @@ class NumericalFeatureReport:
     def statistics_frame(self) -> pd.DataFrame:
         """Return descriptive statistics for each available feature."""
         return self.statistics.copy(deep=True)
+
+    def exploration_frame(
+        self,
+        *,
+        skewness_review_threshold: float = 0.5,
+        format_percentages: bool = True,
+    ) -> pd.DataFrame:
+        """Return a compact table for notebook numerical exploration."""
+        if not isinstance(skewness_review_threshold, Real) or isinstance(
+            skewness_review_threshold, bool
+        ):
+            raise TypeError(
+                "skewness_review_threshold must be a non-negative real "
+                "number."
+            )
+
+        threshold = float(skewness_review_threshold)
+        if threshold < 0:
+            raise ValueError(
+                "skewness_review_threshold must be zero or greater."
+            )
+
+        frame = self.statistics.loc[
+            :,
+            [
+                "Feature",
+                "Minimum",
+                "Q1",
+                "Median",
+                "Mean",
+                "Q3",
+                "Maximum",
+                "Standard deviation",
+                "IQR",
+                "Skewness",
+                "Outlier count",
+                "Outlier percent",
+            ],
+        ].copy(deep=True)
+
+        frame.insert(
+            10,
+            "Distribution shape",
+            [
+                _describe_distribution_shape(value, threshold=threshold)
+                for value in frame["Skewness"]
+            ],
+        )
+
+        if format_percentages:
+            frame["Outlier percent"] = frame["Outlier percent"].map(
+                lambda value: f"{float(value):.2%}"
+            )
+
+        return frame.loc[:, _EXPLORATION_COLUMNS]
 
     def outlier_summary_frame(self) -> pd.DataFrame:
         """Return IQR fences and outlier counts by feature."""
@@ -881,3 +952,149 @@ def _display_value(value: object) -> str:
     if pd.isna(value):
         return "<missing>"
     return repr(value)
+
+
+def _describe_distribution_shape(
+    skewness: object,
+    *,
+    threshold: float,
+) -> str:
+    """Return a descriptive label for observed skewness."""
+    if skewness is None or pd.isna(skewness):
+        return "Unavailable"
+
+    skewness_value = float(skewness)
+    if skewness_value >= threshold:
+        return "Right-skewed"
+    if skewness_value <= -threshold:
+        return "Left-skewed"
+    return "Approximately symmetric"
+
+
+def _normalize_plot_columns(columns: int) -> int:
+    if not isinstance(columns, int) or isinstance(columns, bool):
+        raise TypeError("columns must be an integer.")
+    if columns <= 0:
+        raise ValueError("columns must be greater than zero.")
+    return columns
+
+
+def plot_numerical_distributions(
+    report: NumericalFeatureReport,
+    *,
+    columns: int = 4,
+    bins: str | int = "auto",
+    figure_width_per_column: float = 4.0,
+    figure_height_per_row: float = 3.0,
+):
+    """Return a compact histogram overview for all numerical features."""
+    from matplotlib import pyplot as plt
+
+    if not isinstance(report, NumericalFeatureReport):
+        raise TypeError("report must be a NumericalFeatureReport.")
+
+    columns = _normalize_plot_columns(columns)
+    features = report.available_features
+    if not features:
+        raise NumericalAnalysisError(
+            "cannot plot numerical distributions without available features."
+        )
+
+    row_count = (len(features) + columns - 1) // columns
+    figure, axes = plt.subplots(
+        row_count,
+        columns,
+        figsize=(
+            figure_width_per_column * columns,
+            figure_height_per_row * row_count,
+        ),
+        squeeze=False,
+    )
+
+    statistics = report.statistics.set_index("Feature")
+    projection = report.numeric_projection
+
+    for axis, feature in zip(axes.flat, features, strict=False):
+        values = projection[feature].dropna()
+        feature_statistics = statistics.loc[feature]
+
+        axis.hist(values, bins=bins)
+
+        mean = feature_statistics["Mean"]
+        median = feature_statistics["Median"]
+
+        if mean is not None and not pd.isna(mean):
+            axis.axvline(
+                float(mean),
+                linestyle="--",
+                linewidth=1,
+                label="Mean",
+            )
+        if median is not None and not pd.isna(median):
+            axis.axvline(
+                float(median),
+                linestyle=":",
+                linewidth=1,
+                label="Median",
+            )
+
+        axis.set_title(str(feature))
+        axis.set_ylabel("Count")
+        axis.grid(axis="y", alpha=0.2)
+        axis.legend(fontsize="small")
+
+    for axis in axes.flat[len(features):]:
+        axis.set_visible(False)
+
+    figure.suptitle("Numerical Feature Distributions", y=1.01)
+    figure.tight_layout()
+    return figure
+
+
+def plot_numerical_boxplots(
+    report: NumericalFeatureReport,
+    *,
+    columns: int = 4,
+    figure_width_per_column: float = 4.0,
+    figure_height_per_row: float = 2.2,
+):
+    """Return a compact boxplot overview for candidate-outlier inspection."""
+    from matplotlib import pyplot as plt
+
+    if not isinstance(report, NumericalFeatureReport):
+        raise TypeError("report must be a NumericalFeatureReport.")
+
+    columns = _normalize_plot_columns(columns)
+    features = report.available_features
+    if not features:
+        raise NumericalAnalysisError(
+            "cannot plot numerical boxplots without available features."
+        )
+
+    row_count = (len(features) + columns - 1) // columns
+    figure, axes = plt.subplots(
+        row_count,
+        columns,
+        figsize=(
+            figure_width_per_column * columns,
+            figure_height_per_row * row_count,
+        ),
+        squeeze=False,
+    )
+
+    projection = report.numeric_projection
+
+    for axis, feature in zip(axes.flat, features, strict=False):
+        values = projection[feature].dropna()
+        if not values.empty:
+            axis.boxplot(values, vert=False)
+        axis.set_title(str(feature))
+        axis.set_yticks([])
+        axis.grid(axis="x", alpha=0.2)
+
+    for axis in axes.flat[len(features):]:
+        axis.set_visible(False)
+
+    figure.suptitle("Numerical Feature Outlier Overview", y=1.01)
+    figure.tight_layout()
+    return figure

@@ -433,3 +433,105 @@ def test_frames_are_defensive_copies() -> None:
         "Value",
         "Interpretation",
     ]
+
+
+def test_exploration_frame_is_compact_and_interprets_skewness() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "symmetric": [1, 2, 3, 4, 5],
+            "right_skewed": [1, 1, 1, 1, 10],
+        }
+    )
+
+    report = analyze_numerical_features(
+        dataframe,
+        features=("symmetric", "right_skewed"),
+    )
+
+    frame = report.exploration_frame(skewness_review_threshold=0.5)
+
+    assert list(frame.columns) == [
+        "Feature",
+        "Minimum",
+        "Q1",
+        "Median",
+        "Mean",
+        "Q3",
+        "Maximum",
+        "Standard deviation",
+        "IQR",
+        "Skewness",
+        "Distribution shape",
+        "Outlier count",
+        "Outlier percent",
+    ]
+    assert frame.loc[0, "Distribution shape"] == "Approximately symmetric"
+    assert frame.loc[1, "Distribution shape"] == "Right-skewed"
+    assert frame.loc[0, "Outlier percent"].endswith("%")
+
+
+def test_exploration_frame_can_preserve_numeric_outlier_percent() -> None:
+    dataframe = pd.DataFrame({"value": [1, 2, 2, 3, 100]})
+    report = analyze_numerical_features(dataframe, features=("value",))
+
+    frame = report.exploration_frame(format_percentages=False)
+
+    assert frame.iloc[0]["Outlier percent"] == pytest.approx(0.2)
+
+
+def test_exploration_frame_validates_skewness_threshold() -> None:
+    dataframe = pd.DataFrame({"value": [1, 2, 3]})
+    report = analyze_numerical_features(dataframe, features=("value",))
+
+    with pytest.raises(ValueError, match="zero or greater"):
+        report.exploration_frame(skewness_review_threshold=-0.1)
+
+
+def test_distribution_overview_plot_covers_all_features() -> None:
+    from matplotlib import pyplot as plt
+
+    from scripts.analyze_numerical import plot_numerical_distributions
+
+    dataframe = pd.DataFrame(
+        {
+            "a": [1, 2, 3],
+            "b": [2, 3, 4],
+            "c": [3, 4, 5],
+        }
+    )
+    report = analyze_numerical_features(
+        dataframe,
+        features=("a", "b", "c"),
+    )
+
+    figure = plot_numerical_distributions(report, columns=2)
+
+    try:
+        visible_axes = [axis for axis in figure.axes if axis.get_visible()]
+        assert [axis.get_title() for axis in visible_axes] == ["a", "b", "c"]
+    finally:
+        plt.close(figure)
+
+
+def test_boxplot_overview_plot_covers_all_features() -> None:
+    from matplotlib import pyplot as plt
+
+    from scripts.analyze_numerical import plot_numerical_boxplots
+
+    dataframe = pd.DataFrame(
+        {
+            "a": [1, 2, 3],
+            "b": [2, 3, 100],
+        }
+    )
+    report = analyze_numerical_features(
+        dataframe,
+        features=("a", "b"),
+    )
+
+    figure = plot_numerical_boxplots(report, columns=2)
+
+    try:
+        assert [axis.get_title() for axis in figure.axes] == ["a", "b"]
+    finally:
+        plt.close(figure)
