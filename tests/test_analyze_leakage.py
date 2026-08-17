@@ -578,3 +578,292 @@ def test_results_are_deterministic() -> None:
         first.risk_register_frame(),
         second.risk_register_frame(),
     )
+
+
+def _static_dry_bean_like_frame() -> pd.DataFrame:
+    import math
+
+    rows = []
+    classes = ["A", "B", "C", "A", "B", "C"]
+    for index, label in enumerate(classes, start=1):
+        area = float(1000 + 120 * index)
+        major = float(50 + 3 * index)
+        minor = float(35 + 2 * index)
+        perimeter = float(140 + 5 * index)
+        convex_area = area + 25.0
+        equiv = math.sqrt(4.0 * area / math.pi)
+        rows.append(
+            {
+                "Area": area,
+                "Perimeter": perimeter,
+                "MajorAxisLength": major,
+                "MinorAxisLength": minor,
+                "AspectRatio": major / minor,
+                "Eccentricity": math.sqrt(1.0 - (minor / major) ** 2),
+                "ConvexArea": convex_area,
+                "EquivDiameter": equiv,
+                "Extent": 0.75,
+                "Solidity": area / convex_area,
+                "Roundness": 4.0 * math.pi * area / perimeter**2,
+                "Compactness": equiv / major,
+                "ShapeFactor1": major / area,
+                "ShapeFactor2": minor / area,
+                "ShapeFactor3": 4.0 * area / (math.pi * major**2),
+                "ShapeFactor4": 4.0 * area / (math.pi * major * minor),
+                "Class": label,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _static_dependencies():
+    from scripts.analyze_leakage import (
+        ellipse_eccentricity_dependency,
+        equivalent_circle_diameter_dependency,
+        external_dependency,
+        ratio_dependency,
+        roundness_dependency,
+        shape_factor_3_dependency,
+        shape_factor_4_dependency,
+    )
+
+    return (
+        ratio_dependency(
+            "AspectRatio",
+            numerator="MajorAxisLength",
+            denominator="MinorAxisLength",
+        ),
+        ellipse_eccentricity_dependency(
+            "Eccentricity",
+            major_axis="MajorAxisLength",
+            minor_axis="MinorAxisLength",
+        ),
+        equivalent_circle_diameter_dependency("EquivDiameter", area="Area"),
+        external_dependency(
+            "Extent",
+            sources=("Area", "BoundingBoxArea"),
+            formula="Area / BoundingBoxArea",
+            note="BoundingBoxArea is not retained.",
+        ),
+        ratio_dependency(
+            "Solidity",
+            numerator="Area",
+            denominator="ConvexArea",
+        ),
+        roundness_dependency(
+            "Roundness",
+            area="Area",
+            perimeter="Perimeter",
+        ),
+        ratio_dependency(
+            "Compactness",
+            numerator="EquivDiameter",
+            denominator="MajorAxisLength",
+        ),
+        ratio_dependency(
+            "ShapeFactor1",
+            numerator="MajorAxisLength",
+            denominator="Area",
+        ),
+        ratio_dependency(
+            "ShapeFactor2",
+            numerator="MinorAxisLength",
+            denominator="Area",
+        ),
+        shape_factor_3_dependency(
+            "ShapeFactor3",
+            area="Area",
+            major_axis="MajorAxisLength",
+        ),
+        shape_factor_4_dependency(
+            "ShapeFactor4",
+            area="Area",
+            major_axis="MajorAxisLength",
+            minor_axis="MinorAxisLength",
+        ),
+    )
+
+
+def test_static_classification_audit_confirms_retained_dependencies() -> None:
+    from scripts.analyze_leakage import analyze_static_classification_leakage
+
+    dataframe = _static_dry_bean_like_frame()
+    features = tuple(column for column in dataframe if column != "Class")
+    report = analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=features,
+        derived_dependencies=_static_dependencies(),
+    )
+
+    assert report.is_structurally_valid
+    assert not report.has_direct_target_leakage
+    assert report.confirmed_derived_dependency_count == 10
+    assert report.external_dependency_count == 1
+    confirmed = report.dependency_frame().loc[
+        lambda frame: frame["Dependency status"].eq(
+            "Confirmed from retained columns"
+        )
+    ]
+    assert len(confirmed) == 10
+    assert confirmed["Match rate"].eq(1.0).all()
+
+
+def test_static_classification_audit_keeps_external_dependency_descriptive() -> None:
+    from scripts.analyze_leakage import analyze_static_classification_leakage
+
+    dataframe = _static_dry_bean_like_frame()
+    report = analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=tuple(column for column in dataframe if column != "Class"),
+        derived_dependencies=_static_dependencies(),
+    )
+
+    extent = report.dependency_frame().set_index("Derived feature").loc["Extent"]
+    assert not bool(extent["Auditable from retained columns"])
+    assert extent["Dependency status"] == "Documented; source column not retained"
+    assert pd.isna(extent["Match rate"])
+
+
+def test_static_classification_audit_detects_target_proxy() -> None:
+    from scripts.analyze_leakage import analyze_static_classification_leakage
+
+    dataframe = _static_dry_bean_like_frame().assign(
+        proxy=lambda frame: frame["Class"]
+    )
+    report = analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=("Area", "proxy"),
+    )
+
+    assert report.has_target_proxy_candidates
+    assert report.has_direct_target_leakage
+    assert report.target_proxy_candidates_frame().iloc[0]["Field"] == "proxy"
+
+
+def test_static_classification_audit_rejects_target_as_candidate() -> None:
+    from scripts.analyze_leakage import analyze_static_classification_leakage
+
+    dataframe = _static_dry_bean_like_frame()
+    report = analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=("Area", "Class"),
+    )
+
+    assert not report.is_structurally_valid
+    with pytest.raises(DataLeakageAnalysisError, match="Target included as candidate"):
+        report.raise_if_invalid()
+
+
+def test_static_classification_audit_flags_target_derived_dependency() -> None:
+    from scripts.analyze_leakage import (
+        DerivedFeatureDependencySpec,
+        analyze_static_classification_leakage,
+    )
+
+    dataframe = _static_dry_bean_like_frame()
+    spec = DerivedFeatureDependencySpec(
+        feature="Area",
+        sources=("Class",),
+        formula="target-derived synthetic value",
+        operation=None,
+        note="Synthetic test.",
+    )
+    report = analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=("Area",),
+        derived_dependencies=(spec,),
+    )
+
+    assert report.has_target_derived_dependencies
+    assert report.has_direct_target_leakage
+    assert report.dependency_frame().iloc[0]["Dependency status"] == "Target-derived leakage"
+
+
+def test_static_classification_audit_reports_unconfirmed_dependency() -> None:
+    from scripts.analyze_leakage import (
+        analyze_static_classification_leakage,
+        ratio_dependency,
+    )
+
+    dataframe = _static_dry_bean_like_frame().copy()
+    dataframe.loc[0, "AspectRatio"] *= 2
+    report = analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=("AspectRatio", "MajorAxisLength", "MinorAxisLength"),
+        derived_dependencies=(
+            ratio_dependency(
+                "AspectRatio",
+                numerator="MajorAxisLength",
+                denominator="MinorAxisLength",
+            ),
+        ),
+        confirmation_rate=1.0,
+    )
+
+    row = report.dependency_frame().iloc[0]
+    assert row["Match rate"] < 1.0
+    assert row["Dependency status"] == "Declared dependency not confirmed"
+
+
+def test_static_classification_audit_requires_sources_for_evaluable_dependency() -> None:
+    from scripts.analyze_leakage import (
+        analyze_static_classification_leakage,
+        ratio_dependency,
+    )
+
+    dataframe = _static_dry_bean_like_frame().drop(columns="MinorAxisLength")
+    report = analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=("AspectRatio", "MajorAxisLength"),
+        derived_dependencies=(
+            ratio_dependency(
+                "AspectRatio",
+                numerator="MajorAxisLength",
+                denominator="MinorAxisLength",
+            ),
+        ),
+    )
+
+    with pytest.raises(DataLeakageAnalysisError, match="Dependency source missing"):
+        report.raise_if_invalid()
+
+
+def test_static_classification_audit_does_not_mutate_dataframe() -> None:
+    from scripts.analyze_leakage import analyze_static_classification_leakage
+
+    dataframe = _static_dry_bean_like_frame()
+    before = dataframe.copy(deep=True)
+    analyze_static_classification_leakage(
+        dataframe,
+        target="Class",
+        candidate_features=tuple(column for column in dataframe if column != "Class"),
+        derived_dependencies=_static_dependencies(),
+    )
+    pd.testing.assert_frame_equal(dataframe, before)
+
+
+def test_static_classification_audit_validates_tolerances() -> None:
+    from scripts.analyze_leakage import analyze_static_classification_leakage
+
+    dataframe = _static_dry_bean_like_frame()
+    with pytest.raises(DataLeakageAnalysisError, match="non-negative"):
+        analyze_static_classification_leakage(
+            dataframe,
+            target="Class",
+            candidate_features=("Area",),
+            relative_tolerance=-1,
+        )
+    with pytest.raises(DataLeakageAnalysisError, match="between 0 and 1"):
+        analyze_static_classification_leakage(
+            dataframe,
+            target="Class",
+            candidate_features=("Area",),
+            confirmation_rate=1.1,
+        )
