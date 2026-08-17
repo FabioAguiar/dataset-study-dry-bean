@@ -63,6 +63,54 @@ def test_observation_report_does_not_modify_source_dataframe() -> None:
     pd.testing.assert_frame_equal(dataframe, original)
 
 
+def test_observation_report_supports_missing_source_identifier() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature": [1.0, 2.0, 3.0],
+            "class": ["A", "B", "C"],
+        }
+    )
+
+    report = analyze_observation_unit(dataframe)
+
+    assert report.identifier is None
+    assert report.row_count == 3
+    assert not report.has_source_identifier
+    assert report.non_null_identifier_count is None
+    assert report.unique_identifier_count is None
+    assert report.missing_identifier_count is None
+    assert report.duplicate_identifier_count is None
+    assert report.duplicated_row_count is None
+    assert report.is_complete is None
+    assert report.is_unique is None
+    assert report.duplicated_rows.empty
+
+    summary = report.summary_frame()
+    assert list(summary["Metric"]) == [
+        "Rows",
+        "Source identifier",
+        "Identifier completeness",
+        "Identifier uniqueness",
+    ]
+    assert list(summary["Value"]) == [
+        3,
+        "Not provided",
+        "Not assessable",
+        "Not assessable",
+    ]
+
+
+def test_observation_report_without_identifier_cannot_validate_key_rules() -> None:
+    dataframe = pd.DataFrame({"feature": [1, 2]})
+    report = analyze_observation_unit(dataframe)
+
+    with pytest.raises(
+        DataValidationError,
+        match="does not provide an observation identifier",
+    ):
+        report.raise_if_invalid()
+
+
 def test_data_type_report_matches_semantic_and_exact_types() -> None:
     dataframe = pd.DataFrame(
         {

@@ -53,39 +53,70 @@ class DataValidationError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ObservationUnitReport:
-    """Summarize identifier completeness and uniqueness for a dataset."""
+    """Summarize row identity evidence for a tabular dataset."""
 
-    identifier: str
+    identifier: str | None
     row_count: int
-    non_null_identifier_count: int
-    unique_identifier_count: int
-    missing_identifier_count: int
-    duplicate_identifier_count: int
-    duplicated_row_count: int
+    non_null_identifier_count: int | None
+    unique_identifier_count: int | None
+    missing_identifier_count: int | None
+    duplicate_identifier_count: int | None
+    duplicated_row_count: int | None
     duplicated_rows: pd.DataFrame
 
     @property
-    def has_missing_identifiers(self) -> bool:
-        """Return whether at least one identifier is absent."""
+    def has_source_identifier(self) -> bool:
+        """Return whether the source dataset provides an observation key."""
+        return self.identifier is not None
+
+    @property
+    def has_missing_identifiers(self) -> bool | None:
+        """Return identifier completeness status when it can be assessed."""
+        if self.missing_identifier_count is None:
+            return None
         return self.missing_identifier_count > 0
 
     @property
-    def has_duplicates(self) -> bool:
-        """Return whether at least one non-null identifier is repeated."""
+    def has_duplicates(self) -> bool | None:
+        """Return identifier duplication status when it can be assessed."""
+        if self.duplicate_identifier_count is None:
+            return None
         return self.duplicate_identifier_count > 0
 
     @property
-    def is_complete(self) -> bool:
-        """Return whether every row contains an identifier."""
+    def is_complete(self) -> bool | None:
+        """Return identifier completeness, or ``None`` when unavailable."""
+        if self.has_missing_identifiers is None:
+            return None
         return not self.has_missing_identifiers
 
     @property
-    def is_unique(self) -> bool:
-        """Return whether every non-null identifier occurs once."""
+    def is_unique(self) -> bool | None:
+        """Return identifier uniqueness, or ``None`` when unavailable."""
+        if self.has_duplicates is None:
+            return None
         return not self.has_duplicates
 
     def summary_frame(self) -> pd.DataFrame:
-        """Return a notebook-friendly metric table."""
+        """Return a notebook-friendly observation identity summary."""
+        if not self.has_source_identifier:
+            return pd.DataFrame(
+                {
+                    "Metric": [
+                        "Rows",
+                        "Source identifier",
+                        "Identifier completeness",
+                        "Identifier uniqueness",
+                    ],
+                    "Value": [
+                        self.row_count,
+                        "Not provided",
+                        "Not assessable",
+                        "Not assessable",
+                    ],
+                }
+            )
+
         return pd.DataFrame(
             {
                 "Metric": [
@@ -113,7 +144,17 @@ class ObservationUnitReport:
         require_complete: bool = True,
         require_unique: bool = True,
     ) -> None:
-        """Raise one consolidated error for violated expectations."""
+        """Raise one consolidated error for violated identity expectations."""
+        if (
+            not self.has_source_identifier
+            and (require_complete or require_unique)
+        ):
+            raise DataValidationError(
+                "The source dataset does not provide an observation "
+                "identifier, so identifier completeness and uniqueness "
+                "cannot be validated."
+            )
+
         failures: list[str] = []
 
         if require_complete and self.has_missing_identifiers:
@@ -687,13 +728,26 @@ def _analytical_role(
 
 def analyze_observation_unit(
     dataframe: pd.DataFrame,
-    identifier: str,
+    identifier: str | None = None,
 ) -> ObservationUnitReport:
-    """Analyze whether one identifier supports a row-level observation unit.
+    """Describe row identity with or without a source identifier.
 
-    The input DataFrame is never modified. Missing identifiers and repeated
-    non-null identifiers are reported separately.
+    The input DataFrame is never modified. When ``identifier`` is ``None``,
+    the report records that key-based completeness and uniqueness cannot be
+    assessed; full-row duplicate analysis remains a separate concern.
     """
+    if identifier is None:
+        return ObservationUnitReport(
+            identifier=None,
+            row_count=int(len(dataframe)),
+            non_null_identifier_count=None,
+            unique_identifier_count=None,
+            missing_identifier_count=None,
+            duplicate_identifier_count=None,
+            duplicated_row_count=None,
+            duplicated_rows=dataframe.iloc[0:0].copy(),
+        )
+
     normalized_identifier = identifier.strip()
 
     if not normalized_identifier:
