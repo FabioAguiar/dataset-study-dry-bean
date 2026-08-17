@@ -556,3 +556,173 @@ def test_results_are_deterministic() -> None:
     )
     pd.testing.assert_frame_equal(first.guardrails_frame(), second.guardrails_frame())
     pd.testing.assert_frame_equal(first.split_policy_frame(), second.split_policy_frame())
+
+
+# ---------------------------------------------------------------------------
+# Static multiclass preparation planning
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from scripts.record_preparation_decisions import (
+    record_static_multiclass_preparation_decisions,
+)
+
+
+def _static_multiclass_reports(*, unconfirmed_dependency: bool = True):
+    dependency_rows = [
+        {
+            "Derived feature": "ShapeFactor1",
+            "Dependency status": "Confirmed from retained columns",
+        }
+    ]
+    if unconfirmed_dependency:
+        dependency_rows.append(
+            {
+                "Derived feature": "ShapeFactor2",
+                "Dependency status": "Declared dependency not confirmed",
+            }
+        )
+
+    leakage = SimpleNamespace(
+        has_direct_target_leakage=False,
+        confirmed_derived_dependency_count=1,
+        dependency_frame=lambda: pd.DataFrame(dependency_rows),
+    )
+    duplicate = SimpleNamespace(
+        has_source_identifiers=False,
+        exact_duplicate_group_count=68,
+        exact_duplicate_row_count=136,
+    )
+    target = SimpleNamespace(
+        class_count=7,
+        has_issues=False,
+        imbalance_ratio=6.7931,
+        normalized_class_entropy=0.9427,
+    )
+    numerical = SimpleNamespace(
+        features_with_outliers=("Area", "Perimeter"),
+    )
+    relationships = SimpleNamespace(
+        numerical_relationships=pd.DataFrame(
+            {
+                "Potential redundancy": [True, True, False],
+            }
+        ),
+    )
+    quality = SimpleNamespace(
+        is_structurally_valid=True,
+        has_must_fix_actions=False,
+        has_external_blockers=False,
+    )
+    insights = SimpleNamespace(
+        is_ready_for_preparation_decisions=True,
+    )
+    return {
+        "duplicate_report": duplicate,
+        "target_report": target,
+        "numerical_report": numerical,
+        "feature_relationship_report": relationships,
+        "leakage_report": leakage,
+        "quality_report": quality,
+        "exploratory_insights_report": insights,
+    }
+
+
+def _static_multiclass_report(**overrides: object):
+    reports = _static_multiclass_reports()
+    reports.update(overrides)
+    return record_static_multiclass_preparation_decisions(
+        available_fields=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2", "Class"),
+        target="Class",
+        target_classes=("A", "B", "C", "D", "E", "F", "G"),
+        candidate_features=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2"),
+        identifiers=(),
+        train_fraction=0.70,
+        validation_fraction=0.15,
+        test_fraction=0.15,
+        random_seed=42,
+        **reports,
+    )
+
+
+def test_static_multiclass_plan_is_structurally_valid_and_split_ready() -> None:
+    report = _static_multiclass_report()
+
+    assert report.is_structurally_valid
+    assert report.is_ready_for_deterministic_preparation
+    assert report.is_ready_for_split_execution
+    assert not report.is_ready_for_modeling
+
+
+def test_static_multiclass_plan_preserves_snapshot_split_contract() -> None:
+    report = _static_multiclass_report()
+    policy = report.split_policy
+
+    assert policy["train_fraction"] == pytest.approx(0.70)
+    assert policy["validation_fraction"] == pytest.approx(0.15)
+    assert policy["test_fraction"] == pytest.approx(0.15)
+    assert policy["stratify_by"] == "Class"
+    assert policy["temporal_policy_status"] == "Resolved snapshot fallback"
+    assert policy["group_by_identifiers"] == ()
+
+
+def test_static_multiclass_plan_defers_unconfirmed_dependency_pruning() -> None:
+    report = _static_multiclass_report()
+    decisions = report.decisions_frame().set_index("Decision ID")
+
+    assert decisions.loc["PREP-009", "Status"] == "Deferred"
+    assert decisions.loc["PREP-009", "Affected fields"] == ("ShapeFactor2",)
+    assert decisions.loc["PREP-004", "Status"] == "Approved"
+
+
+def test_static_multiclass_plan_omits_dependency_decision_when_fully_confirmed() -> None:
+    reports = _static_multiclass_reports(unconfirmed_dependency=False)
+    report = record_static_multiclass_preparation_decisions(
+        available_fields=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2", "Class"),
+        target="Class",
+        target_classes=("A", "B", "C", "D", "E", "F", "G"),
+        candidate_features=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2"),
+        identifiers=(),
+        **reports,
+    )
+
+    assert "PREP-009" not in set(report.decisions_frame()["Decision ID"])
+
+
+def test_static_multiclass_plan_rejects_must_fix_quality_actions() -> None:
+    reports = _static_multiclass_reports()
+    reports["quality_report"] = SimpleNamespace(
+        is_structurally_valid=True,
+        has_must_fix_actions=True,
+        has_external_blockers=False,
+    )
+
+    with pytest.raises(PreparationDecisionContractError, match="must-fix"):
+        record_static_multiclass_preparation_decisions(
+            available_fields=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2", "Class"),
+            target="Class",
+            target_classes=("A", "B", "C", "D", "E", "F", "G"),
+            candidate_features=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2"),
+            identifiers=(),
+            **reports,
+        )
+
+
+def test_static_multiclass_plan_rejects_direct_target_leakage() -> None:
+    reports = _static_multiclass_reports()
+    reports["leakage_report"] = SimpleNamespace(
+        has_direct_target_leakage=True,
+        confirmed_derived_dependency_count=0,
+        dependency_frame=lambda: pd.DataFrame(),
+    )
+
+    with pytest.raises(PreparationDecisionContractError, match="Direct target leakage"):
+        record_static_multiclass_preparation_decisions(
+            available_fields=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2", "Class"),
+            target="Class",
+            target_classes=("A", "B", "C", "D", "E", "F", "G"),
+            candidate_features=("Area", "Perimeter", "ShapeFactor1", "ShapeFactor2"),
+            identifiers=(),
+            **reports,
+        )

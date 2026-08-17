@@ -800,6 +800,665 @@ def record_preparation_decisions(
     )
 
 
+
+def record_static_multiclass_preparation_decisions(
+    *,
+    available_fields: Sequence[object],
+    target: str,
+    target_classes: Sequence[object],
+    candidate_features: Sequence[object],
+    identifiers: Sequence[object] | None,
+    duplicate_report: object,
+    target_report: object,
+    numerical_report: object,
+    feature_relationship_report: object,
+    leakage_report: object,
+    quality_report: object,
+    exploratory_insights_report: object,
+    train_fraction: float = 0.70,
+    validation_fraction: float = 0.15,
+    test_fraction: float = 0.15,
+    random_seed: int = 42,
+) -> PreparationDecisionReport:
+    """Build a traceable preparation plan for a static multiclass snapshot.
+
+    The function records decisions only. It never mutates the source data,
+    splits observations, fits transformers, resamples classes, selects
+    features, or trains a model. Dataset-specific source semantics remain
+    explicit in the notebook through ``target``, ``target_classes``,
+    ``candidate_features``, and the split parameters.
+    """
+    fields = _unique_text_tuple(available_fields)
+    features = _unique_text_tuple(candidate_features)
+    id_columns = _unique_text_tuple(identifiers or ())
+    classes = tuple(deepcopy(tuple(target_classes)))
+    target_name = _text(target)
+
+    if not target_name or target_name not in set(fields):
+        raise PreparationDecisionContractError(
+            f"Target {target_name!r} is not available for preparation."
+        )
+    if not features:
+        raise PreparationDecisionContractError(
+            "At least one candidate feature is required."
+        )
+    unknown_features = tuple(value for value in features if value not in set(fields))
+    if unknown_features:
+        raise PreparationDecisionContractError(
+            f"Candidate features are not available: {unknown_features!r}."
+        )
+    unknown_ids = tuple(value for value in id_columns if value not in set(fields))
+    if unknown_ids:
+        raise PreparationDecisionContractError(
+            f"Identifier fields are not available: {unknown_ids!r}."
+        )
+    if target_name in set(features):
+        raise PreparationDecisionContractError(
+            "The target cannot be included in candidate_features."
+        )
+    if len(classes) < 3:
+        raise PreparationDecisionContractError(
+            "Static multiclass preparation requires at least three target classes."
+        )
+
+    if not bool(getattr(quality_report, "is_structurally_valid", False)):
+        raise PreparationDecisionContractError(
+            "The initial data-quality report must be structurally valid."
+        )
+    if bool(getattr(quality_report, "has_must_fix_actions", False)):
+        raise PreparationDecisionContractError(
+            "Deterministic must-fix data-quality actions require an explicit "
+            "dataset-specific preparation decision before automatic planning."
+        )
+    if bool(getattr(quality_report, "has_external_blockers", False)):
+        raise PreparationDecisionContractError(
+            "External data-quality blockers must be resolved before preparation planning."
+        )
+    if not bool(
+        getattr(
+            exploratory_insights_report,
+            "is_ready_for_preparation_decisions",
+            False,
+        )
+    ):
+        raise PreparationDecisionContractError(
+            "Exploratory insights are not ready to inform preparation decisions."
+        )
+
+    if int(getattr(target_report, "class_count", 0)) != len(classes):
+        raise PreparationDecisionContractError(
+            "Observed multiclass target cardinality does not match the declared contract."
+        )
+    if bool(getattr(target_report, "has_issues", True)):
+        raise PreparationDecisionContractError(
+            "Target distribution contains missing, absent, or unexpected classes."
+        )
+    if bool(getattr(leakage_report, "has_direct_target_leakage", True)):
+        raise PreparationDecisionContractError(
+            "Direct target leakage must be resolved before preparation decisions are recorded."
+        )
+
+    dependency_frame = leakage_report.dependency_frame()
+    if dependency_frame.empty:
+        unconfirmed_dependencies: tuple[str, ...] = ()
+    else:
+        mask = dependency_frame["Dependency status"].eq(
+            "Declared dependency not confirmed"
+        )
+        unconfirmed_dependencies = tuple(
+            str(value)
+            for value in dependency_frame.loc[mask, "Derived feature"]
+        )
+
+    redundancy_count = 0
+    numerical_relationships = getattr(
+        feature_relationship_report,
+        "numerical_relationships",
+        pd.DataFrame(),
+    )
+    if (
+        isinstance(numerical_relationships, pd.DataFrame)
+        and not numerical_relationships.empty
+        and "Potential redundancy" in numerical_relationships.columns
+    ):
+        redundancy_count = int(
+            numerical_relationships["Potential redundancy"].fillna(False).sum()
+        )
+
+    exact_duplicate_groups = int(
+        getattr(duplicate_report, "exact_duplicate_group_count", 0)
+    )
+    exact_duplicate_rows = int(
+        getattr(duplicate_report, "exact_duplicate_row_count", 0)
+    )
+    has_source_identifiers = bool(
+        getattr(duplicate_report, "has_source_identifiers", False)
+    )
+    outlier_features = tuple(
+        str(value)
+        for value in getattr(numerical_report, "features_with_outliers", ())
+    )
+    imbalance_ratio = getattr(target_report, "imbalance_ratio", None)
+    normalized_entropy = getattr(
+        target_report, "normalized_class_entropy", None
+    )
+
+    def decision(
+        decision_id: str,
+        domain: str,
+        title: str,
+        affected_fields: Sequence[object],
+        status: str,
+        phase: str,
+        fit_scope: str,
+        operation: str,
+        rationale: str,
+        acceptance_criteria: str,
+        source_stages: Sequence[object],
+        prerequisites: Sequence[object] = (),
+    ) -> dict[str, object]:
+        return {
+            "decision_id": decision_id,
+            "domain": domain,
+            "title": title,
+            "affected_fields": tuple(affected_fields),
+            "status": status,
+            "phase": phase,
+            "fit_scope": fit_scope,
+            "operation": operation,
+            "rationale": rationale,
+            "prerequisites": tuple(prerequisites),
+            "acceptance_criteria": acceptance_criteria,
+            "source_stages": tuple(str(value) for value in source_stages),
+        }
+
+    decisions: list[dict[str, object]] = [
+        decision(
+            "PREP-001",
+            "Cleaning",
+            "Preserve the validated source observations",
+            fields,
+            "Approved",
+            "Before split",
+            "Deterministic",
+            (
+                "Create a defensive prepared copy without changing values, "
+                "row count, column semantics, or target labels."
+            ),
+            (
+                "Source-backed type, domain, and value checks found no "
+                "deterministic repair requirement."
+            ),
+            (
+                "Prepared row count and values match the validated source "
+                "before any split or learned transformation."
+            ),
+            ("7", "8", "16"),
+        ),
+        decision(
+            "PREP-002",
+            "Cleaning",
+            "Prohibit unsupported deduplication and generic outlier treatment",
+            fields,
+            "Prohibited",
+            "Before split",
+            "None",
+            (
+                "Do not drop exact row matches without independent source "
+                "identity evidence; do not delete, clip, winsorize, or replace "
+                "values solely because they are IQR outlier candidates."
+            ),
+            (
+                "The source provides no observation identifier, while numerical "
+                "extremes remain domain-valid measurements."
+            ),
+            (
+                "No row or value is altered by equality-only deduplication or a "
+                "generic IQR rule."
+            ),
+            ("9", "11", "16", "17"),
+        ),
+        decision(
+            "PREP-003",
+            "Target governance",
+            "Preserve the nominal multiclass target contract",
+            (target_name,),
+            "Approved",
+            "Before split",
+            "None",
+            (
+                "Keep every declared class label readable in prepared data and "
+                "exclude the target and any target derivative from predictors."
+            ),
+            "All declared classes are observed and no binary positive-class semantics apply.",
+            (
+                "Prepared y contains exactly the declared class set and X never "
+                "contains the target."
+            ),
+            ("5", "10", "15", "16"),
+        ),
+        decision(
+            "PREP-004",
+            "Feature role",
+            "Use the complete validated candidate-feature set as the baseline",
+            features,
+            "Approved",
+            "Before split",
+            "None",
+            (
+                "Start downstream model evaluation with all validated numerical "
+                "candidate features, including documented derived measurements."
+            ),
+            (
+                "Correlation and mathematical redundancy are exploratory evidence, "
+                "not sufficient grounds for global feature deletion."
+            ),
+            "Baseline X contains exactly the declared candidate features.",
+            ("6", "12", "15", "17"),
+        ),
+        decision(
+            "PREP-005",
+            "Dataset splitting",
+            "Use a reproducible stratified snapshot split",
+            (target_name,),
+            "Approved",
+            "Split",
+            "None",
+            (
+                f"Partition the validated snapshot into {train_fraction:.0%} train, "
+                f"{validation_fraction:.0%} validation, and {test_fraction:.0%} test "
+                f"with stratification by {target_name} and random seed {random_seed}."
+            ),
+            (
+                "The released table has no chronological evaluation field, while "
+                "unequal multiclass support makes stratification important."
+            ),
+            (
+                "Partitions are reproducible, disjoint, preserve every target class, "
+                "and keep the final test holdout untouched."
+            ),
+            ("10", "15", "17"),
+            ("PREP-001", "PREP-003"),
+        ),
+        decision(
+            "PREP-006",
+            "Transformation",
+            "Make numerical scaling model-dependent and train-fitted",
+            features,
+            "Conditional",
+            "Train-only transformation",
+            "Train only",
+            (
+                "Preserve original numerical values and fit scaling only inside "
+                "candidate pipelines whose model family requires or benefits from it."
+            ),
+            "All predictors are numerical, but scale sensitivity depends on model family.",
+            (
+                "Any scaler is fitted on training data only; validation and test "
+                "are transform-only and never refit preprocessing."
+            ),
+            ("7", "11", "15", "17"),
+            ("PREP-005",),
+        ),
+        decision(
+            "PREP-007",
+            "Feature engineering",
+            "Defer class-imbalance mitigation to model selection",
+            (target_name,),
+            "Deferred",
+            "Model selection",
+            "Evaluation only",
+            (
+                "Use stratification as the baseline policy and compare class "
+                "weighting or training-only resampling only if validation evidence "
+                "shows a benefit for macro and per-class metrics."
+            ),
+            (
+                "Class support is unequal, but frequency alone does not justify "
+                "altering the released distribution."
+            ),
+            (
+                "Any imbalance strategy is evaluated inside training/validation; "
+                "validation and test prevalence remains untouched."
+            ),
+            ("10", "16", "17"),
+            ("PREP-005",),
+        ),
+        decision(
+            "PREP-008",
+            "Feature engineering",
+            "Defer redundancy reduction to leakage-safe ablation",
+            features,
+            "Deferred",
+            "Model selection",
+            "Evaluation only",
+            (
+                "Compare the all-feature baseline with regularized or ablated "
+                "feature sets using training and validation evidence only."
+            ),
+            (
+                f"{redundancy_count} feature pair(s) meet the declared redundancy "
+                "review rule and multiple measurements are mathematically derived."
+            ),
+            (
+                "No feature is removed globally from EDA rankings; any reduced set "
+                "must match or improve validation objectives before adoption."
+            ),
+            ("12", "15", "17"),
+            ("PREP-004", "PREP-005"),
+        ),
+        decision(
+            "PREP-010",
+            "Leakage governance",
+            "Split before every learned target-aware or distribution-aware operation",
+            tuple(features) + (target_name,),
+            "Approved",
+            "Split",
+            "None",
+            (
+                "Perform the approved split before fitting scalers, selectors, "
+                "resampling strategies, target-aware rankings, or model parameters."
+            ),
+            "Held-out partitions must not influence learned preparation choices.",
+            (
+                "All learned operations record train-only fit scope and the final "
+                "test partition is used only after the model contract is frozen."
+            ),
+            ("15", "17"),
+            ("PREP-005",),
+        ),
+    ]
+
+    if unconfirmed_dependencies:
+        decisions.append(
+            decision(
+                "PREP-009",
+                "Feature engineering",
+                "Keep unconfirmed derived dependencies out of automatic pruning",
+                unconfirmed_dependencies,
+                "Deferred",
+                "Model selection",
+                "Evaluation only",
+                (
+                    "Retain these features in the baseline and verify source formula "
+                    "or tolerance assumptions before using dependency claims to prune them."
+                ),
+                (
+                    "At least one declared mathematical dependency did not reproduce "
+                    "the released values within the exploratory tolerance."
+                ),
+                (
+                    "Each unresolved dependency is either source-verified or treated "
+                    "as an ordinary candidate feature during model evaluation."
+                ),
+                ("15", "16", "17"),
+                ("PREP-004",),
+            )
+        )
+
+    evidence_specs = {
+        "PREP-001": (
+            "quality_report",
+            "validated source quality",
+            {
+                "must_fix_actions": bool(getattr(quality_report, "has_must_fix_actions", False)),
+                "external_blockers": bool(getattr(quality_report, "has_external_blockers", False)),
+            },
+            "No deterministic repair is required before copying the source.",
+        ),
+        "PREP-002": (
+            "duplicate_report + numerical_report",
+            "review-only cleaning evidence",
+            {
+                "source_identifiers_available": has_source_identifiers,
+                "exact_duplicate_groups": exact_duplicate_groups,
+                "exact_duplicate_rows": exact_duplicate_rows,
+                "features_with_iqr_candidates": outlier_features,
+            },
+            "Equality without source identity and IQR extremeness do not prove invalid observations.",
+        ),
+        "PREP-003": (
+            "target_report",
+            "multiclass target contract",
+            {"class_count": len(classes), "classes": classes},
+            "All declared classes must remain present and target-only.",
+        ),
+        "PREP-004": (
+            "feature_relationship_report + leakage_report",
+            "baseline feature governance",
+            {
+                "candidate_feature_count": len(features),
+                "redundancy_candidates": redundancy_count,
+                "confirmed_derived_dependencies": int(
+                    getattr(leakage_report, "confirmed_derived_dependency_count", 0)
+                ),
+            },
+            "Redundancy requires validation, not global deletion during preparation.",
+        ),
+        "PREP-005": (
+            "target_report",
+            "class-support evidence",
+            {
+                "imbalance_ratio": imbalance_ratio,
+                "normalized_class_entropy": normalized_entropy,
+            },
+            "Use a reproducible class-aware split for the static snapshot.",
+        ),
+        "PREP-006": (
+            "numerical_report",
+            "numerical predictor contract",
+            {"numerical_feature_count": len(features)},
+            "Scaling policy must be selected per model and fitted on training only.",
+        ),
+        "PREP-007": (
+            "target_report",
+            "unequal multiclass support",
+            {"imbalance_ratio": imbalance_ratio},
+            "Do not alter class prevalence without validation evidence.",
+        ),
+        "PREP-008": (
+            "feature_relationship_report",
+            "redundancy review",
+            {"redundancy_candidates": redundancy_count},
+            "Ablation belongs inside model selection.",
+        ),
+        "PREP-010": (
+            "leakage_report",
+            "target-isolation audit",
+            {"direct_target_leakage": bool(getattr(leakage_report, "has_direct_target_leakage", False))},
+            "Learned operations must never fit on held-out partitions.",
+        ),
+    }
+    if unconfirmed_dependencies:
+        evidence_specs["PREP-009"] = (
+            "leakage_report + quality_report",
+            "unconfirmed derived-feature provenance",
+            {"features": unconfirmed_dependencies},
+            "Unconfirmed formulas cannot justify automatic feature pruning.",
+        )
+
+    evidence: list[dict[str, object]] = []
+    for index, item in enumerate(decisions, start=1):
+        decision_id = str(item["decision_id"])
+        source_report, source_item, observed_value, interpretation = evidence_specs[decision_id]
+        evidence.append(
+            {
+                "evidence_id": f"PDE-{index:03d}",
+                "decision_id": decision_id,
+                "source_report": source_report,
+                "source_item": source_item,
+                "observed_value": observed_value,
+                "expected_or_reference": "Stage 18 preparation policy",
+                "interpretation": interpretation,
+            }
+        )
+
+    deferred_decision_ids = [
+        item["decision_id"]
+        for item in decisions
+        if item["status"] == "Deferred"
+    ]
+
+    execution_steps: list[dict[str, object]] = [
+        {
+            "step_id": "STEP-001",
+            "sequence": 1,
+            "decision_ids": ("PREP-001", "PREP-002", "PREP-003", "PREP-004"),
+            "phase": "Before split",
+            "action": "Revalidate the raw table and create an unchanged prepared projection.",
+            "blocking": True,
+            "status": "Planned",
+            "temporal_dependency": False,
+            "acceptance_criteria": "Source values and row count are preserved and analytical roles are isolated.",
+        },
+        {
+            "step_id": "STEP-002",
+            "sequence": 2,
+            "decision_ids": ("PREP-005", "PREP-010"),
+            "phase": "Split",
+            "action": "Create reproducible stratified train, validation, and test partitions.",
+            "blocking": True,
+            "status": "Planned",
+            "temporal_dependency": False,
+            "acceptance_criteria": "Partitions are disjoint, class-aware, reproducible, and preserve the final test holdout.",
+        },
+        {
+            "step_id": "STEP-003",
+            "sequence": 3,
+            "decision_ids": ("PREP-006",),
+            "phase": "Train-only transformation",
+            "action": "Fit model-dependent numerical preprocessing on training data only.",
+            "blocking": True,
+            "status": "Planned",
+            "temporal_dependency": False,
+            "acceptance_criteria": "Validation and test are transform-only and no scaler is globally fitted.",
+        },
+        {
+            "step_id": "STEP-004",
+            "sequence": 4,
+            "decision_ids": tuple(deferred_decision_ids),
+            "phase": "Model selection",
+            "action": "Evaluate imbalance and redundancy alternatives without changing the baseline handoff.",
+            "blocking": False,
+            "status": "Deferred",
+            "temporal_dependency": False,
+            "acceptance_criteria": "Alternatives are adopted only from training/validation evidence.",
+        },
+        {
+            "step_id": "STEP-005",
+            "sequence": 5,
+            "decision_ids": tuple(item["decision_id"] for item in decisions),
+            "phase": "Model selection",
+            "action": "Freeze the selected preparation and feature contract before final test evaluation.",
+            "blocking": True,
+            "status": "Deferred",
+            "temporal_dependency": False,
+            "acceptance_criteria": "The final test set is accessed only after preprocessing, feature policy, and model-selection choices are frozen.",
+        },
+    ]
+
+    def guardrail(
+        guardrail_id: str,
+        domain: str,
+        title: str,
+        affected_fields: Sequence[object],
+        severity: str,
+        prohibited_operation: str,
+        rationale: str,
+        verification: str,
+    ) -> dict[str, object]:
+        return {
+            "guardrail_id": guardrail_id,
+            "domain": domain,
+            "title": title,
+            "affected_fields": tuple(affected_fields),
+            "severity": severity,
+            "status": "Active",
+            "prohibited_operation": prohibited_operation,
+            "rationale": rationale,
+            "verification": verification,
+        }
+
+    guardrails = (
+        guardrail(
+            "GRD-001", "Cleaning", "Preserve the raw evidence", fields, "Critical",
+            "Modify or overwrite the acquired raw table in place.",
+            "Reproducible preparation requires immutable source evidence.",
+            "Raw shape, values, index, and dtypes remain unchanged.",
+        ),
+        guardrail(
+            "GRD-002", "Cleaning", "Do not deduplicate from row equality alone", fields, "High",
+            "Drop exact matches without independent observation identity evidence.",
+            "The released Dry Bean table does not provide a source observation identifier.",
+            "No source row is removed solely because all released values match another row.",
+        ),
+        guardrail(
+            "GRD-003", "Cleaning", "Do not apply generic outlier cleaning", features, "High",
+            "Delete, clip, winsorize, or replace values solely from an IQR flag.",
+            "IQR flags are distributional evidence and the audited values remain domain-valid.",
+            "The baseline prepared projection preserves every numerical value.",
+        ),
+        guardrail(
+            "GRD-004", "Target governance", "Keep the target outside predictors", (target_name,), "Critical",
+            "Include the target or a direct derivative in X or feature transformations.",
+            "This would constitute direct target leakage.",
+            "Predictor matrices contain exactly candidate features and never the target.",
+        ),
+        guardrail(
+            "GRD-005", "Leakage governance", "Fit learned preprocessing on training only", features, "Critical",
+            "Fit scaling, selection, resampling, or learned transformations before splitting or on held-out data.",
+            "Held-out data must not influence learned preparation parameters.",
+            "Every learned transformer records train-only fit scope.",
+        ),
+        guardrail(
+            "GRD-006", "Dataset splitting", "Do not resample validation or test", (target_name,), "Critical",
+            "Over- or undersample validation or test partitions.",
+            "Held-out prevalence must remain representative of the released snapshot.",
+            "Validation and test row sets retain their original class composition.",
+        ),
+        guardrail(
+            "GRD-007", "Feature engineering", "Do not select features globally", features, "Critical",
+            "Use full-data target associations or redundancy rankings to choose the final feature set.",
+            "Global selection would bias held-out evaluation.",
+            "Ablation and selection use training/validation evidence only.",
+        ),
+        guardrail(
+            "GRD-008", "Dataset splitting", "Protect the final test holdout", (target_name,), "Critical",
+            "Use final-test metrics for model, feature, resampling, or hyperparameter selection.",
+            "Repeated test access converts the final holdout into validation data.",
+            "Final test evaluation occurs only after the analysis contract is frozen.",
+        ),
+    )
+
+    split_policy = {
+        "train_fraction": train_fraction,
+        "validation_fraction": validation_fraction,
+        "test_fraction": test_fraction,
+        "stratify_by": target_name,
+        "random_seed": random_seed,
+        "shuffle": True,
+        "temporal_priority": True,
+        "temporal_policy_status": "Resolved snapshot fallback",
+        "random_split_fallback": (
+            "Approved for this source-released static classification snapshot: "
+            "no chronological observation field is available in the analytical table."
+        ),
+        "test_holdout_untouched": True,
+        "disjoint_partitions_required": True,
+        "group_by_identifiers": id_columns,
+    }
+
+    report = record_preparation_decisions(
+        available_fields=fields,
+        decisions=decisions,
+        evidence=evidence,
+        execution_steps=execution_steps,
+        guardrails=guardrails,
+        split_policy=split_policy,
+    )
+    report.raise_if_invalid()
+    return report
+
 def _normalize_decisions(
     declarations: Sequence[Mapping[str, object]],
     *,
