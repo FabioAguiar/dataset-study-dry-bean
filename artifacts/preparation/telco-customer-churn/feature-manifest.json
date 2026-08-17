@@ -1,0 +1,215 @@
+{
+  "schema_version": "feature-manifest.v1",
+  "artifact_type": "feature_manifest",
+  "dataset_slug": "telco-customer-churn",
+  "identifier_columns": [
+    "customerID"
+  ],
+  "feature_columns": [
+    "gender",
+    "SeniorCitizen",
+    "Partner",
+    "Dependents",
+    "tenure",
+    "PhoneService",
+    "MultipleLines",
+    "InternetService",
+    "OnlineSecurity",
+    "OnlineBackup",
+    "DeviceProtection",
+    "TechSupport",
+    "StreamingTV",
+    "StreamingMovies",
+    "Contract",
+    "PaperlessBilling",
+    "PaymentMethod",
+    "MonthlyCharges",
+    "TotalCharges"
+  ],
+  "numerical_features": [
+    "tenure",
+    "MonthlyCharges",
+    "TotalCharges"
+  ],
+  "categorical_features": [
+    "gender",
+    "SeniorCitizen",
+    "Partner",
+    "Dependents",
+    "PhoneService",
+    "MultipleLines",
+    "InternetService",
+    "OnlineSecurity",
+    "OnlineBackup",
+    "DeviceProtection",
+    "TechSupport",
+    "StreamingTV",
+    "StreamingMovies",
+    "Contract",
+    "PaperlessBilling",
+    "PaymentMethod"
+  ],
+  "categorical_expected_values": {
+    "gender": [
+      "Female",
+      "Male"
+    ],
+    "SeniorCitizen": [
+      0,
+      1
+    ],
+    "Partner": [
+      "No",
+      "Yes"
+    ],
+    "Dependents": [
+      "No",
+      "Yes"
+    ],
+    "PhoneService": [
+      "No",
+      "Yes"
+    ],
+    "MultipleLines": [
+      "No",
+      "Yes",
+      "No phone service"
+    ],
+    "InternetService": [
+      "DSL",
+      "Fiber optic",
+      "No"
+    ],
+    "OnlineSecurity": [
+      "No",
+      "Yes",
+      "No internet service"
+    ],
+    "OnlineBackup": [
+      "No",
+      "Yes",
+      "No internet service"
+    ],
+    "DeviceProtection": [
+      "No",
+      "Yes",
+      "No internet service"
+    ],
+    "TechSupport": [
+      "No",
+      "Yes",
+      "No internet service"
+    ],
+    "StreamingTV": [
+      "No",
+      "Yes",
+      "No internet service"
+    ],
+    "StreamingMovies": [
+      "No",
+      "Yes",
+      "No internet service"
+    ],
+    "Contract": [
+      "Month-to-month",
+      "One year",
+      "Two year"
+    ],
+    "PaperlessBilling": [
+      "No",
+      "Yes"
+    ],
+    "PaymentMethod": [
+      "Electronic check",
+      "Mailed check",
+      "Bank transfer (automatic)",
+      "Credit card (automatic)"
+    ]
+  },
+  "target_column": "Churn",
+  "target_classes": [
+    "No",
+    "Yes"
+  ],
+  "positive_target_class": "Yes",
+  "target_encoding_contract": {
+    "No": 0,
+    "Yes": 1
+  },
+  "expected_dtypes": {
+    "raw": {
+      "customerID": "string",
+      "gender": "string",
+      "SeniorCitizen": "integer",
+      "Partner": "string",
+      "Dependents": "string",
+      "tenure": "integer",
+      "PhoneService": "string",
+      "MultipleLines": "string",
+      "InternetService": "string",
+      "OnlineSecurity": "string",
+      "OnlineBackup": "string",
+      "DeviceProtection": "string",
+      "TechSupport": "string",
+      "StreamingTV": "string",
+      "StreamingMovies": "string",
+      "Contract": "string",
+      "PaperlessBilling": "string",
+      "PaymentMethod": "string",
+      "MonthlyCharges": "numeric",
+      "TotalCharges": "numeric",
+      "Churn": "string"
+    },
+    "prepared": {
+      "customerID": "string",
+      "gender": "string",
+      "SeniorCitizen": "integer",
+      "Partner": "string",
+      "Dependents": "string",
+      "tenure": "integer",
+      "PhoneService": "string",
+      "MultipleLines": "string",
+      "InternetService": "string",
+      "OnlineSecurity": "string",
+      "OnlineBackup": "string",
+      "DeviceProtection": "string",
+      "TechSupport": "string",
+      "StreamingTV": "string",
+      "StreamingMovies": "string",
+      "Contract": "string",
+      "PaperlessBilling": "string",
+      "PaymentMethod": "string",
+      "MonthlyCharges": "numeric",
+      "TotalCharges": "numeric",
+      "Churn": "string"
+    }
+  },
+  "preprocessing_contract": {
+    "categorical_strategy": "one_hot",
+    "categorical_fit_scope": "inside_training_fold",
+    "unknown_category_policy": "ignore_and_report",
+    "drop_category": null,
+    "numerical_scaling": "model_specific",
+    "numerical_fit_scope": "inside_training_fold",
+    "learned_transformations_fitted_in_notebook_02": false,
+    "deferred_operations": [
+      "TotalCharges log1p comparison",
+      "scaler comparison",
+      "tenure and TotalCharges ablation",
+      "regularization",
+      "feature interactions",
+      "class weights",
+      "oversampling",
+      "undersampling",
+      "SMOTE",
+      "feature selection",
+      "model comparison",
+      "threshold selection"
+    ]
+  },
+  "prohibited_predictors": [
+    "customerID",
+    "Churn",
+    "target-derived metrics"
+  ]
+}

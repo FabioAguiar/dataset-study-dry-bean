@@ -1,0 +1,77 @@
+{
+  "schema_version": "milestone_state.v1",
+  "artifact_type": "milestone_state",
+  "project_id": "dataset-study-telco-customer-churn",
+  "source_of_truth": {
+    "milestones_document": "docs/milestones.md",
+    "formal_issue_source": "support_workspace",
+    "architecture_document": "docs/architecture.md",
+    "vision_document": "docs/vision.md",
+    "operational_state_document": "docs/project-status/milestone-state.json"
+  },
+  "formal_issue_location": {
+    "workspace_alias": "project_support_root",
+    "project_support_subpath": "dataset-study-telco-customer-churn",
+    "formal_issues_index_pattern": "issues/{milestone_id}/formal-issues-index.json",
+    "formal_issue_json_pattern": "issues/{milestone_id}/{issue_id}/formal-issue.json",
+    "formal_issue_markdown_pattern": "issues/{milestone_id}/{issue_id}/issue.md",
+    "github_role": "publication_target_or_human_reference"
+  },
+  "current_milestone": {
+    "id": "M0",
+    "title": "Fundação da análise e compreensão inicial do dataset",
+    "status": "active"
+  },
+  "last_completed_milestone": null,
+  "completed_milestones": [],
+  "locked_completed_milestones": [],
+  "reopen_records": [],
+  "regression_policy": {
+    "allow_return_to_completed_milestone": false,
+    "requires_explicit_reopen_record": true
+  },
+  "validation_rules": {
+    "current_milestone_must_exist_in_milestones_document": true,
+    "current_milestone_must_not_be_completed": true,
+    "current_milestone_must_not_be_locked": true,
+    "completed_milestone_reopen_requires_record": true,
+    "milestones_document_is_planning_not_operational_state": true,
+    "implementation_documentation_strategy_is_not_defined_here": true
+  },
+  "implementation_documentation_boundary": {
+    "strategy_source": "docs/architecture.md",
+    "reflected_by": "docs/milestones.md",
+    "selected_strategy": "data-analysis-documentation",
+    "state_file_role": "This file records the operational milestone cursor only and does not create, update, or authorize analysis notebooks, scripts, reports, models, datasets, or implementation documentation."
+  },
+  "operational_boundary": {
+    "state": "This file records the observable operational milestone state for the dataset-study-telco-customer-churn project.",
+    "intent": "Study goals, dataset understanding, analytical planning, methodology, experiments, results, and conclusions remain in project documents, notebooks, scripts, and reports.",
+    "control": "Workflows and scripts may validate this state before continuing the analysis pipeline; this file does not execute analysis, modify data, train models, publish results, or authorize implementation."
+  },
+  "known_milestones": [
+    {
+      "id": "M0",
+      "title": "Fundação da análise e compreensão inicial do dataset",
+      "status": "active"
+    }
+  ],
+  "notes": [
+    "This file records operational milestone state only.",
+    "M0 is the initial active milestone for a generic data-analysis project.",
+    "No milestone has been completed or locked yet.",
+    "M0 should be validated against docs/milestones.md before workflow continuation.",
+    "Formal issues are resolved from the support workspace using formal_issue_location patterns; GitHub is only a publication target or human reference.",
+    "docs/milestones.md remains the planning document and must not be treated as the operational cursor.",
+    "docs/architecture.md defines the analysis and implementation documentation strategy; this file only records milestone state.",
+    "Notebooks, scripts, reports, datasets, models, issues, handoffs, and workflows may use this state as validation input but must not infer authorization to execute work from this file alone.",
+    "The canonical repository location is docs/project-status/milestone-state.json."
+  ],
+  "documentation_boundary": {
+    "vision_document": "docs/vision.md",
+    "architecture_document": "docs/architecture.md",
+    "milestones_document": "docs/milestones.md",
+    "implementation_documentation": "Defined by docs/architecture.md and reflected by docs/milestones.md when applicable; not decided by this state file.",
+    "state_document": "docs/project-status/milestone-state.json"
+  }
+}

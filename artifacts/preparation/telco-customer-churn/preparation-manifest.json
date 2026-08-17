@@ -1,0 +1,81 @@
+{
+  "schema_version": "preparation-manifest.v1",
+  "artifact_type": "preparation_manifest",
+  "dataset_slug": "telco-customer-churn",
+  "contract_version": "tabular-preparation.v1",
+  "source_path": "data/raw/telco-customer-churn/WA_Fn-UseC_-Telco-Customer-Churn.csv",
+  "source_filename": "WA_Fn-UseC_-Telco-Customer-Churn.csv",
+  "source_sha256": "88be4b93fbe0cc83421af1c503794c97c342eca914c1576db7c276e61d61358a",
+  "source_sha256_after": "88be4b93fbe0cc83421af1c503794c97c342eca914c1576db7c276e61d61358a",
+  "prepared_path": "data/processed/telco-customer-churn/prepared.csv",
+  "prepared_sha256": "2b6eb0af34b82c8903bc06a8011cba1cc15ccfbda4e67df711df44070a0785ba",
+  "source_row_count": 7043,
+  "prepared_row_count": 7043,
+  "source_column_count": 21,
+  "prepared_column_count": 21,
+  "column_order": [
+    "customerID",
+    "gender",
+    "SeniorCitizen",
+    "Partner",
+    "Dependents",
+    "tenure",
+    "PhoneService",
+    "MultipleLines",
+    "InternetService",
+    "OnlineSecurity",
+    "OnlineBackup",
+    "DeviceProtection",
+    "TechSupport",
+    "StreamingTV",
+    "StreamingMovies",
+    "Contract",
+    "PaperlessBilling",
+    "PaymentMethod",
+    "MonthlyCharges",
+    "TotalCharges",
+    "Churn"
+  ],
+  "deterministic_rules": [
+    {
+      "column": "TotalCharges",
+      "condition_column": "tenure",
+      "condition_value": 0,
+      "blank_replacement": 0.0,
+      "strip_strings": true
+    }
+  ],
+  "materialized_value_counts": {
+    "TotalCharges": 11
+  },
+  "invalid_conversion_counts": {
+    "TotalCharges": 0
+  },
+  "row_preservation_checks": {
+    "row_count_preserved": true,
+    "column_count_preserved": true,
+    "column_order_preserved": true
+  },
+  "raw_immutability_checks": {
+    "logical_fingerprint_before": "90d72b056df6f126b3341cb782928a8624801eece8ac4595ccd71dfff2b7fb69",
+    "logical_fingerprint_after": "90d72b056df6f126b3341cb782928a8624801eece8ac4595ccd71dfff2b7fb69",
+    "logical_fingerprint_preserved": true,
+    "source_sha256_preserved": true
+  },
+  "runtime_versions": {
+    "python": "3.13.13",
+    "pandas": "3.0.5",
+    "scikit_learn": "1.9.0"
+  },
+  "readiness": {
+    "deterministic_preparation_ready": true,
+    "prepared_dataset_materialized": true,
+    "benchmark_split_ready": true,
+    "benchmark_partitions_materialized": true,
+    "educational_model_selection_ready": true,
+    "operational_modeling_ready": false,
+    "temporal_contract_status": "unresolved",
+    "feature_inference_availability": "unconfirmed",
+    "operational_validity": "unconfirmed"
+  }
+}
