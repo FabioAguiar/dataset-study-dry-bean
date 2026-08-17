@@ -301,3 +301,104 @@ def test_analysis_does_not_modify_the_source_dataframe() -> None:
     )
 
     pd.testing.assert_frame_equal(dataframe, before)
+
+
+
+def test_multiclass_target_without_positive_class_uses_neutral_roles() -> None:
+    dataframe = pd.DataFrame(
+        {"Class": ["A", "A", "A", "B", "B", "C"]}
+    )
+
+    report = analyze_target_distribution(
+        dataframe,
+        target="Class",
+        expected_classes=("A", "B", "C"),
+    )
+
+    assert report.positive_class is None
+    assert report.positive_class_share is None
+    assert list(report.distribution_frame()["Role"]) == [
+        "Majority",
+        "Intermediate",
+        "Minority",
+    ]
+    assert "Positive class" not in set(report.summary_frame()["Metric"])
+    assert "Positive-class prevalence" not in set(
+        report.summary_frame()["Metric"]
+    )
+
+
+def test_normalized_class_entropy_is_one_for_equal_class_shares() -> None:
+    dataframe = pd.DataFrame(
+        {"Class": ["A", "B", "C", "A", "B", "C"]}
+    )
+    report = analyze_target_distribution(
+        dataframe,
+        target="Class",
+        expected_classes=("A", "B", "C"),
+    )
+
+    assert report.normalized_class_entropy == pytest.approx(1.0)
+
+
+def test_normalized_class_entropy_reflects_multiclass_imbalance() -> None:
+    dataframe = pd.DataFrame(
+        {"Class": ["A"] * 8 + ["B"] * 3 + ["C"]}
+    )
+    report = analyze_target_distribution(
+        dataframe,
+        target="Class",
+        expected_classes=("A", "B", "C"),
+    )
+
+    assert report.normalized_class_entropy is not None
+    assert 0.0 < report.normalized_class_entropy < 1.0
+
+
+def test_distribution_frame_can_format_percentages_for_display() -> None:
+    dataframe = pd.DataFrame({"Class": ["A", "A", "B", "C"]})
+    report = analyze_target_distribution(
+        dataframe,
+        target="Class",
+        expected_classes=("A", "B", "C"),
+    )
+
+    formatted = report.distribution_frame(format_percentages=True)
+
+    assert list(formatted["Percentage"]) == [
+        "50.00%",
+        "25.00%",
+        "25.00%",
+    ]
+    assert report.distribution_frame().iloc[0]["Percentage"] == pytest.approx(
+        0.5
+    )
+
+
+def test_target_distribution_plot_uses_report_classes() -> None:
+    from matplotlib import pyplot as plt
+
+    from scripts.analyze_target import plot_target_distribution
+
+    dataframe = pd.DataFrame({"Class": ["A", "A", "B", "C"]})
+    report = analyze_target_distribution(
+        dataframe,
+        target="Class",
+        expected_classes=("A", "B", "C"),
+    )
+
+    figure = plot_target_distribution(
+        report,
+        title="Example target distribution",
+    )
+
+    try:
+        axis = figure.axes[0]
+        assert axis.get_title() == "Example target distribution"
+        assert [tick.get_text() for tick in axis.get_xticklabels()] == [
+            "A",
+            "B",
+            "C",
+        ]
+    finally:
+        plt.close(figure)

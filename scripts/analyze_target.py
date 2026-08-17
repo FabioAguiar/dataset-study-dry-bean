@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import log
 from typing import Final
 
 import pandas as pd
@@ -118,6 +119,23 @@ class TargetDistributionReport:
         return self.positive_class_count / self.non_missing_count
 
     @property
+    def normalized_class_entropy(self) -> float | None:
+        """Return normalized entropy across observed classes in [0, 1]."""
+        if self.non_missing_count == 0 or self.class_count < 2:
+            return None
+
+        counts = self.distribution.loc[
+            self.distribution["Count"] > 0,
+            "Count",
+        ]
+        proportions = counts / self.non_missing_count
+        entropy = -sum(
+            float(value) * log(float(value))
+            for value in proportions
+        )
+        return entropy / log(self.class_count)
+
+    @property
     def majority_baseline_accuracy(self) -> float | None:
         """Return the accuracy of always predicting a majority class."""
         return self.majority_share
@@ -222,25 +240,50 @@ class TargetDistributionReport:
                 "Interpretation": "Descriptive imbalance indicator",
             },
             {
-                "Metric": "Positive class",
+                "Metric": "Normalized class entropy",
                 "Value": (
-                    "Not declared"
-                    if self.positive_class is None
-                    else repr(self.positive_class)
+                    "Not available"
+                    if self.normalized_class_entropy is None
+                    else round(self.normalized_class_entropy, 4)
                 ),
-                "Interpretation": "Outcome treated as positive",
-            },
-            {
-                "Metric": "Positive-class prevalence",
-                "Value": percent(self.positive_class_share),
-                "Interpretation": "Share of non-missing target values",
+                "Interpretation": (
+                    "1.0 indicates equal proportions across observed classes"
+                ),
             },
         ]
+
+        if self.positive_class is not None:
+            rows.extend(
+                [
+                    {
+                        "Metric": "Positive class",
+                        "Value": repr(self.positive_class),
+                        "Interpretation": "Outcome treated as positive",
+                    },
+                    {
+                        "Metric": "Positive-class prevalence",
+                        "Value": percent(self.positive_class_share),
+                        "Interpretation": (
+                            "Share of non-missing target values"
+                        ),
+                    },
+                ]
+            )
+
         return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
 
-    def distribution_frame(self) -> pd.DataFrame:
+    def distribution_frame(
+        self,
+        *,
+        format_percentages: bool = False,
+    ) -> pd.DataFrame:
         """Return class counts and percentages in deterministic order."""
-        return self.distribution.copy(deep=True)
+        frame = self.distribution.copy(deep=True)
+        if format_percentages:
+            frame["Percentage"] = frame["Percentage"].map(
+                lambda value: f"{value:.2%}"
+            )
+        return frame
 
     def issues_frame(self) -> pd.DataFrame:
         """Return target conditions requiring review."""
@@ -490,6 +533,50 @@ def analyze_target_distribution(
         positive_class_count=positive_class_count,
         distribution=distribution,
     )
+
+
+def plot_target_distribution(
+    report: TargetDistributionReport,
+    *,
+    title: str,
+    xlabel: str = "Class",
+    ylabel: str = "Observation count",
+):
+    """Create a compact class-count chart with exact share labels."""
+    if not isinstance(report, TargetDistributionReport):
+        raise TypeError("report must be a TargetDistributionReport.")
+    if not isinstance(title, str) or not title.strip():
+        raise TargetAnalysisError("title must be a non-empty string.")
+
+    from matplotlib import pyplot as plt
+
+    distribution = report.distribution_frame()
+    figure, axis = plt.subplots(figsize=(10, 5))
+    bars = axis.bar(
+        distribution["Class"].astype(str),
+        distribution["Count"],
+    )
+    labels = [
+        f"{count:,}\n({percentage:.2%})"
+        for count, percentage in zip(
+            distribution["Count"],
+            distribution["Percentage"],
+            strict=True,
+        )
+    ]
+    axis.bar_label(bars, labels=labels, padding=4)
+    axis.set_title(title.strip())
+    axis.set_xlabel(xlabel)
+    axis.set_ylabel(ylabel)
+
+    if not distribution.empty:
+        maximum = int(distribution["Count"].max())
+        if maximum > 0:
+            axis.set_ylim(0, maximum * 1.18)
+
+    figure.tight_layout()
+    return figure
+
 
 
 def _class_role(
