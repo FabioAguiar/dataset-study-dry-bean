@@ -369,3 +369,96 @@ def test_analysis_does_not_modify_the_dataframe() -> None:
     sampled.at[0, "Classification"] = "changed"
 
     pd.testing.assert_frame_equal(dataframe, before)
+
+
+def test_dataset_without_source_identifiers_is_supported() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [1.0, 2.0, 3.0],
+            "feature_b": [10.0, 20.0, 30.0],
+            "Class": ["A", "B", "C"],
+        }
+    )
+
+    report = analyze_duplicate_records(
+        dataframe,
+        identifiers=(),
+        feature_columns=("feature_a", "feature_b"),
+        target="Class",
+    )
+
+    assert not report.has_source_identifiers
+    assert not report.has_exact_duplicates
+    assert not report.has_duplicate_identifiers
+    assert not report.has_repeated_profiles
+    assert not report.has_quality_issues
+    report.raise_if_invalid()
+
+
+def test_exact_row_matches_without_identifiers_require_review_not_removal() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [1.0, 1.0, 2.0],
+            "feature_b": [10.0, 10.0, 20.0],
+            "Class": ["A", "A", "B"],
+        }
+    )
+
+    report = analyze_duplicate_records(
+        dataframe,
+        identifiers=None,
+        feature_columns=("feature_a", "feature_b"),
+        target="Class",
+    )
+
+    assert report.has_exact_duplicates
+    assert report.exact_duplicate_group_count == 1
+    assert report.exact_duplicate_row_count == 2
+    assert report.has_repeated_profiles
+    assert report.same_target_profile_group_count == 1
+    assert not report.has_quality_issues
+    assert report.issues_frame().empty
+
+    summary = report.summary_frame().set_index("Metric")
+    assert (
+        summary.loc["Exact duplicate records", "Interpretation"]
+        == "Review required; source identity unavailable"
+    )
+    assert (
+        summary.loc["Duplicate identifiers", "Interpretation"]
+        == "Not applicable; source identifier unavailable"
+    )
+
+    report.raise_if_invalid(
+        require_no_exact_duplicates=False,
+        require_unique_identifiers=False,
+        require_no_conflicting_identifiers=False,
+    )
+
+
+def test_repeated_profiles_without_identifiers_can_expose_target_disagreement() -> None:
+    dataframe = pd.DataFrame(
+        {
+            "feature_a": [1.0, 1.0, 2.0],
+            "feature_b": [10.0, 10.0, 20.0],
+            "Class": ["A", "B", "C"],
+        }
+    )
+
+    report = analyze_duplicate_records(
+        dataframe,
+        identifiers=(),
+        feature_columns=("feature_a", "feature_b"),
+        target="Class",
+    )
+
+    assert not report.has_exact_duplicates
+    assert report.has_repeated_profiles
+    assert report.has_target_conflicts
+    assert report.target_conflict_group_count == 1
+    assert report.target_conflict_row_count == 2
+
+    profiles = report.repeated_profiles_frame()
+    assert pd.isna(profiles.iloc[0]["Distinct identifier count"])
+    assert profiles.iloc[0]["Classification"] == "Target disagreement"
+    assert profiles.iloc[0]["Target values"] == "'A', 'B'"

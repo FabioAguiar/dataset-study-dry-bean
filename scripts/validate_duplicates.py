@@ -54,6 +54,7 @@ class DuplicateRecordReport:
     """Summarize exact duplicates, identifier conflicts, and repeated profiles."""
 
     row_count: int
+    identifier_columns: tuple[str, ...]
     exact_duplicate_group_count: int
     exact_duplicate_row_count: int
     duplicate_identifier_group_count: int
@@ -69,6 +70,11 @@ class DuplicateRecordReport:
     exact_duplicates: pd.DataFrame
     identifier_duplicates: pd.DataFrame
     repeated_profiles: pd.DataFrame
+
+    @property
+    def has_source_identifiers(self) -> bool:
+        """Return whether source-backed observation identifiers are available."""
+        return bool(self.identifier_columns)
 
     @property
     def has_exact_duplicates(self) -> bool:
@@ -97,8 +103,10 @@ class DuplicateRecordReport:
 
     @property
     def has_quality_issues(self) -> bool:
-        """Return whether exact duplicates or repeated identifiers were found."""
-        return self.has_exact_duplicates or self.has_duplicate_identifiers
+        """Return whether source identity supports a duplicate quality issue."""
+        return self.has_duplicate_identifiers or (
+            self.has_source_identifiers and self.has_exact_duplicates
+        )
 
     def summary_frame(self) -> pd.DataFrame:
         """Return deterministic duplicate-analysis metrics."""
@@ -107,19 +115,31 @@ class DuplicateRecordReport:
                 "Metric": "Exact duplicate records",
                 "Group count": self.exact_duplicate_group_count,
                 "Row count": self.exact_duplicate_row_count,
-                "Interpretation": "Quality issue",
+                "Interpretation": (
+                    "Quality issue"
+                    if self.has_source_identifiers
+                    else "Review required; source identity unavailable"
+                ),
             },
             {
                 "Metric": "Duplicate identifiers",
                 "Group count": self.duplicate_identifier_group_count,
                 "Row count": self.duplicate_identifier_row_count,
-                "Interpretation": "Quality issue",
+                "Interpretation": (
+                    "Quality issue"
+                    if self.has_source_identifiers
+                    else "Not applicable; source identifier unavailable"
+                ),
             },
             {
                 "Metric": "Conflicting duplicate identifiers",
                 "Group count": self.conflicting_identifier_group_count,
                 "Row count": self.conflicting_identifier_row_count,
-                "Interpretation": "Quality issue",
+                "Interpretation": (
+                    "Quality issue"
+                    if self.has_source_identifiers
+                    else "Not applicable; source identifier unavailable"
+                ),
             },
             {
                 "Metric": "Repeated feature profiles",
@@ -168,7 +188,7 @@ class DuplicateRecordReport:
         """Return only duplicate conditions classified as quality issues."""
         rows: list[dict[str, object]] = []
 
-        if self.has_exact_duplicates:
+        if self.has_exact_duplicates and self.has_source_identifiers:
             rows.append(
                 {
                     "Issue": "Exact duplicate records",
@@ -189,7 +209,7 @@ class DuplicateRecordReport:
                     "Row count": self.duplicate_identifier_row_count,
                     "Potential impact": (
                         "Violates the declared observation unit and may "
-                        "represent repeated or conflicting customer accounts."
+                        "represent repeated or conflicting source observations."
                     ),
                 }
             )
@@ -261,7 +281,7 @@ class DuplicateRecordReport:
 def analyze_duplicate_records(
     dataframe: pd.DataFrame,
     *,
-    identifiers: Collection[str],
+    identifiers: Collection[str] | None,
     feature_columns: Collection[str],
     target: str,
     max_group_samples: int = 10,
@@ -270,13 +290,16 @@ def analyze_duplicate_records(
 
     The analysis distinguishes:
 
-    - exact duplicate rows, including their identifiers;
-    - repeated identifiers with identical or conflicting record content;
-    - feature profiles shared by different identifiers;
+    - exact duplicate rows;
+    - repeated identifiers with identical or conflicting record content when
+      source-backed identifiers are available;
+    - repeated feature profiles;
     - repeated profiles whose target values agree or disagree.
 
-    Repeated feature profiles are not quality issues by default because
-    distinct observations may legitimately share the same measured attributes.
+    When source identifiers are unavailable, exact row matches are evidence for
+    review rather than proof that the same real-world observation was duplicated.
+    Repeated feature profiles are not quality issues by default because distinct
+    observations may legitimately share the same measured attributes.
     """
     if not isinstance(dataframe, pd.DataFrame):
         raise TypeError("dataframe must be a pandas DataFrame.")
@@ -295,9 +318,9 @@ def analyze_duplicate_records(
         )
 
     identifier_columns = _normalize_column_collection(
-        identifiers,
+        () if identifiers is None else identifiers,
         field_name="identifiers",
-        require_non_empty=True,
+        require_non_empty=False,
     )
     features = _normalize_column_collection(
         feature_columns,
@@ -320,9 +343,13 @@ def analyze_duplicate_records(
         dataframe,
         columns=list(dataframe.columns),
     )
-    identifier_groups = _duplicate_groups(
-        dataframe,
-        columns=list(identifier_columns),
+    identifier_groups = (
+        _duplicate_groups(
+            dataframe,
+            columns=list(identifier_columns),
+        )
+        if identifier_columns
+        else []
     )
     profile_groups = _repeated_profile_groups(
         dataframe,
@@ -387,6 +414,7 @@ def analyze_duplicate_records(
 
     return DuplicateRecordReport(
         row_count=len(dataframe),
+        identifier_columns=identifier_columns,
         exact_duplicate_group_count=exact_duplicate_group_count,
         exact_duplicate_row_count=exact_duplicate_row_count,
         duplicate_identifier_group_count=len(identifier_duplicate_rows),
@@ -564,6 +592,10 @@ def _repeated_profile_groups(
     repeated_profiles: list[list[int]] = []
 
     for positions in candidate_groups:
+        if not identifiers:
+            repeated_profiles.append(positions)
+            continue
+
         group = dataframe.iloc[positions]
         distinct_identifiers = group.loc[:, list(identifiers)].drop_duplicates()
         if len(distinct_identifiers) > 1:
@@ -658,8 +690,10 @@ def _build_repeated_profile_rows(
 
     for group_number, positions in enumerate(groups, start=1):
         group = dataframe.iloc[positions]
-        distinct_identifiers = len(
-            group.loc[:, list(identifiers)].drop_duplicates()
+        distinct_identifiers: object = (
+            len(group.loc[:, list(identifiers)].drop_duplicates())
+            if identifiers
+            else pd.NA
         )
         target_values = _ordered_display_values(group[target])
         first_row = group.iloc[0]
