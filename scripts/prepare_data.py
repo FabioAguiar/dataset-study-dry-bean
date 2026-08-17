@@ -18,6 +18,7 @@ import platform
 import shutil
 import tempfile
 import uuid
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -70,6 +71,51 @@ class ArtifactConflictError(PreparationError):
 
 class HandoffValidationError(PreparationError):
     """Raised when a persisted preparation handoff is invalid."""
+
+
+@dataclass(frozen=True, slots=True)
+class SourceIdentityReport:
+    """Validated identity evidence for an independently acquired source."""
+
+    dataset_slug: str
+    source_repository: str
+    source_dataset_id: int
+    source_path: str
+    source_sha256: str
+    row_count: int
+    column_count: int
+    column_order: tuple[str, ...]
+    target_column: str
+    target_classes: tuple[Any, ...]
+    feature_columns: tuple[str, ...]
+    identifier_columns: tuple[str, ...]
+    problem_type: str
+    checks: tuple[tuple[str, bool], ...]
+
+    @property
+    def is_valid(self) -> bool:
+        return all(value for _, value in self.checks)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "dataset_slug": self.dataset_slug,
+            "source_repository": self.source_repository,
+            "source_dataset_id": self.source_dataset_id,
+            "source_path": self.source_path,
+            "source_sha256": self.source_sha256,
+            "row_count": self.row_count,
+            "column_count": self.column_count,
+            "column_order": list(self.column_order),
+            "target_column": self.target_column,
+            "target_classes": list(self.target_classes),
+            "feature_columns": list(self.feature_columns),
+            "feature_count": len(self.feature_columns),
+            "identifier_columns": list(self.identifier_columns),
+            "identifier_count": len(self.identifier_columns),
+            "problem_type": self.problem_type,
+            "checks": dict(self.checks),
+            "valid": self.is_valid,
+        }
 
 
 def _copy_frame(dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -253,11 +299,19 @@ class DatasetPartitions:
     _test: pd.DataFrame
     split_method: str
     rounding_method: str
+    _membership: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    membership_kind: str = "unspecified"
+    membership_semantics: str = "unspecified"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_train", _copy_frame(self._train))
         object.__setattr__(self, "_validation", _copy_frame(self._validation))
         object.__setattr__(self, "_test", _copy_frame(self._test))
+        object.__setattr__(
+            self,
+            "_membership",
+            tuple((str(name), tuple(values)) for name, values in self._membership),
+        )
 
     @property
     def train(self) -> pd.DataFrame:
@@ -278,6 +332,10 @@ class DatasetPartitions:
             "test": self.test,
         }
 
+    def membership_mapping(self) -> dict[str, tuple[str, ...]]:
+        """Return persisted technical or source-identifier membership."""
+        return {name: tuple(values) for name, values in self._membership}
+
 
 @dataclass(frozen=True, slots=True)
 class PartitionValidationReport:
@@ -289,6 +347,9 @@ class PartitionValidationReport:
     membership: tuple[tuple[str, tuple[str, ...]], ...]
     checks: tuple[tuple[str, bool], ...]
     prevalence_tolerance: float
+    membership_kind: str = "source_identifier"
+    membership_semantics: str = "source identifier values"
+    entity_disjointness_status: str = "validated_from_source_identifiers"
 
     @property
     def is_valid(self) -> bool:
@@ -306,6 +367,9 @@ class PartitionValidationReport:
             "membership": {
                 name: list(values) for name, values in self.membership
             },
+            "membership_kind": self.membership_kind,
+            "membership_semantics": self.membership_semantics,
+            "entity_disjointness_status": self.entity_disjointness_status,
             "checks": dict(self.checks),
             "prevalence_tolerance": self.prevalence_tolerance,
             "valid": self.is_valid,
@@ -450,6 +514,201 @@ def fingerprint_dataframe_csv(dataframe: pd.DataFrame) -> str:
     return hashlib.sha256(dataframe_csv_bytes(dataframe)).hexdigest()
 
 
+def json_artifact_bytes(payload: Mapping[str, Any]) -> bytes:
+    """Serialize a JSON artifact exactly as the atomic writer will persist it."""
+    return (
+        json.dumps(
+            _copy_mapping(payload),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def fingerprint_json_artifact(payload: Mapping[str, Any]) -> str:
+    """Return the SHA-256 digest of deterministic JSON artifact bytes."""
+    return hashlib.sha256(json_artifact_bytes(payload)).hexdigest()
+
+
+def validate_source_against_exploration_handoff(
+    dataframe: pd.DataFrame,
+    *,
+    handoff: Mapping[str, Any],
+    source_file: str | Path,
+    project_root: str | Path,
+    dataset_slug: str,
+    source_repository: str,
+    source_dataset_id: int,
+    metadata_file: str | Path | None = None,
+    variables_file: str | Path | None = None,
+) -> SourceIdentityReport:
+    """Fail closed when an independent acquisition differs from Notebook 01.
+
+    The gate validates source bytes and logical source identity as separate
+    claims. UCI metadata and variable roles are checked when their materialized
+    files are supplied.
+    """
+    frame = _copy_frame(dataframe)
+    root = Path(project_root).expanduser().resolve()
+    source_path = Path(source_file).expanduser().resolve()
+    try:
+        logical_path = source_path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise DatasetValidationError(
+            "Source identity gate requires a source file inside project_root."
+        ) from exc
+
+    source_contract = handoff.get("source")
+    prediction_contract = handoff.get("prediction_contract")
+    feature_contract = handoff.get("feature_contract")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (source_contract, prediction_contract, feature_contract)
+    ):
+        raise DatasetValidationError(
+            "Exploration handoff source, prediction, or feature contract is invalid."
+        )
+
+    expected_slug = str(handoff.get("dataset_slug", ""))
+    expected_repository = str(source_contract.get("repository", ""))
+    expected_dataset_id = source_contract.get("dataset_id")
+    expected_path = str(source_contract.get("path", ""))
+    expected_sha = str(source_contract.get("sha256", ""))
+    expected_rows = source_contract.get("row_count")
+    expected_columns = source_contract.get("column_count")
+    expected_order = tuple(str(value) for value in source_contract.get("column_order", ()))
+    target_column = str(prediction_contract.get("target_column", ""))
+    target_classes = tuple(prediction_contract.get("target_classes", ()))
+    problem_type = str(prediction_contract.get("problem_type", ""))
+    feature_columns = tuple(
+        str(value) for value in feature_contract.get("feature_columns", ())
+    )
+    identifier_columns = tuple(
+        str(value) for value in feature_contract.get("identifier_columns", ())
+    )
+
+    comparisons = {
+        "dataset_slug": (dataset_slug, expected_slug),
+        "source_repository": (source_repository, expected_repository),
+        "source_dataset_id": (source_dataset_id, expected_dataset_id),
+        "source_path": (logical_path, expected_path),
+        "source_sha256": (fingerprint_file(source_path), expected_sha),
+        "row_count": (len(frame), expected_rows),
+        "column_count": (len(frame.columns), expected_columns),
+        "column_order": (tuple(str(value) for value in frame.columns), expected_order),
+    }
+    for label, (observed, expected) in comparisons.items():
+        if observed != expected:
+            raise DatasetValidationError(
+                f"Source identity mismatch for {label}: "
+                f"observed={observed!r}, expected={expected!r}."
+            )
+
+    if target_column not in frame.columns:
+        raise DatasetValidationError(
+            f"Source identity mismatch: target column {target_column!r} is absent."
+        )
+    observed_classes = tuple(pd.unique(frame[target_column]).tolist())
+    if set(observed_classes) != set(target_classes):
+        raise DatasetValidationError(
+            "Source identity mismatch for target classes: "
+            f"observed={observed_classes!r}, expected={target_classes!r}."
+        )
+    if len(feature_columns) != int(feature_contract.get("baseline_feature_count", -1)):
+        raise DatasetValidationError("Exploration handoff feature count is inconsistent.")
+    if any(column not in frame.columns for column in (*feature_columns, *identifier_columns)):
+        raise DatasetValidationError(
+            "Source identity mismatch: declared feature or identifier columns are absent."
+        )
+    if set((*identifier_columns, *feature_columns, target_column)) != set(frame.columns):
+        raise DatasetValidationError(
+            "Source identity mismatch: feature, identifier, and target roles do not "
+            "cover the acquired schema."
+        )
+    if problem_type != "multiclass_classification":
+        raise DatasetValidationError(
+            f"Unexpected exploration problem type: {problem_type!r}."
+        )
+    if prediction_contract.get("positive_class") is not None:
+        raise DatasetValidationError(
+            "Multiclass exploration handoff must not declare a positive class."
+        )
+
+    checks: list[tuple[str, bool]] = [
+        ("dataset_slug_matches", True),
+        ("source_repository_matches", True),
+        ("uci_dataset_id_matches", True),
+        ("logical_source_path_matches", True),
+        ("source_sha256_matches", True),
+        ("source_shape_matches", True),
+        ("column_order_matches", True),
+        ("target_contract_matches", True),
+        ("feature_order_matches", True),
+        ("identifier_contract_matches", True),
+        ("problem_type_matches", True),
+    ]
+
+    if metadata_file is not None:
+        metadata_path = Path(metadata_file).expanduser().resolve()
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DatasetValidationError("UCI metadata.json is missing or invalid.") from exc
+        if not isinstance(metadata, Mapping):
+            raise DatasetValidationError("UCI metadata.json must contain an object.")
+        metadata_id = metadata.get("uci_id", metadata.get("id"))
+        if metadata_id is None or int(metadata_id) != int(source_dataset_id):
+            raise DatasetValidationError(
+                "Source identity mismatch for the UCI metadata dataset ID."
+            )
+        checks.append(("uci_metadata_dataset_id_matches", True))
+
+    if variables_file is not None:
+        variables_path = Path(variables_file).expanduser().resolve()
+        try:
+            variables = pd.read_csv(variables_path)
+        except (OSError, pd.errors.ParserError) as exc:
+            raise DatasetValidationError("UCI variables.csv is missing or invalid.") from exc
+        normalized_columns = {str(column).strip().lower(): column for column in variables.columns}
+        if "name" not in normalized_columns or "role" not in normalized_columns:
+            raise DatasetValidationError(
+                "UCI variables.csv must contain name and role columns."
+            )
+        names = variables[normalized_columns["name"]].astype(str).str.strip()
+        roles = variables[normalized_columns["role"]].astype(str).str.strip().str.lower()
+        variable_features = tuple(names.loc[roles.eq("feature")].tolist())
+        variable_targets = tuple(names.loc[roles.eq("target")].tolist())
+        if variable_features != feature_columns:
+            raise DatasetValidationError(
+                "Source identity mismatch for UCI feature-variable order."
+            )
+        if variable_targets != (target_column,):
+            raise DatasetValidationError(
+                "Source identity mismatch for the UCI target-variable contract."
+            )
+        checks.append(("uci_variable_roles_match", True))
+
+    return SourceIdentityReport(
+        dataset_slug=dataset_slug,
+        source_repository=source_repository,
+        source_dataset_id=int(source_dataset_id),
+        source_path=logical_path,
+        source_sha256=fingerprint_file(source_path),
+        row_count=len(frame),
+        column_count=len(frame.columns),
+        column_order=tuple(str(value) for value in frame.columns),
+        target_column=target_column,
+        target_classes=target_classes,
+        feature_columns=feature_columns,
+        identifier_columns=identifier_columns,
+        problem_type=problem_type,
+        checks=tuple(checks),
+    )
+
+
 def _is_string_series(series: pd.Series) -> bool:
     if pandas_types.is_string_dtype(series.dtype):
         return True
@@ -500,8 +759,6 @@ def _validate_contract_configuration(
     features = tuple(feature_columns)
     if not columns:
         raise ValueError("column_order cannot be empty.")
-    if not identifiers:
-        raise ValueError("identifier_columns cannot be empty.")
     if not target_column:
         raise ValueError("target_column cannot be empty.")
     if len(set(columns)) != len(columns):
@@ -648,11 +905,15 @@ def validate_raw_dataset(
     target_counts = tuple(
         (str(value), int((target == value).sum())) for value in expected_target
     )
+    identifier_checks = (
+        (("identifiers_complete", True), ("identifiers_unique", True))
+        if identifier_columns
+        else (("source_identifier_absence_respected", True),)
+    )
     checks = (
         ("required_columns_present", True),
         ("column_order_valid", observed_order == expected_order or allow_unexpected_columns),
-        ("identifiers_complete", True),
-        ("identifiers_unique", True),
+        *identifier_checks,
         ("target_valid", True),
         ("categories_valid", True),
         ("types_valid", True),
@@ -736,7 +997,7 @@ def materialize_conditional_numeric_values(
 def prepare_tabular_dataset(
     dataframe: pd.DataFrame,
     *,
-    conditional_numeric_rules: Sequence[ConditionalNumericRule],
+    conditional_numeric_rules: Sequence[ConditionalNumericRule] = (),
 ) -> PreparedDataset:
     """Create a defensive prepared projection using only explicit rules."""
     prepared = _copy_frame(dataframe)
@@ -922,14 +1183,21 @@ def validate_split_policy(
         raise SplitPolicyError(
             "operational_validity must remain 'unconfirmed' for this benchmark."
         )
-    if policy.temporal_contract_status != "unresolved":
+    allowed_temporal_statuses = {"unresolved", "resolved_static_snapshot"}
+    if policy.temporal_contract_status not in allowed_temporal_statuses:
         raise SplitPolicyError(
-            "temporal_contract_status must remain 'unresolved'."
+            "temporal_contract_status must be 'unresolved' or "
+            "'resolved_static_snapshot'."
         )
     if policy.feature_inference_availability != "unconfirmed":
         raise SplitPolicyError(
             "feature_inference_availability must remain 'unconfirmed'."
         )
+    temporal_check = (
+        {"temporal_contract_unresolved": True}
+        if policy.temporal_contract_status == "unresolved"
+        else {"static_snapshot_contract_resolved": True}
+    )
     return {
         "mode_valid": True,
         "purpose_valid": True,
@@ -939,15 +1207,65 @@ def validate_split_policy(
         "shuffle_valid": True,
         "educational_boundary_valid": True,
         "operational_validity_unconfirmed": True,
-        "temporal_contract_unresolved": True,
+        **temporal_check,
         "feature_inference_availability_unconfirmed": True,
     }
 
 
-def _stable_membership_key(frame: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
-    if columns:
-        key_frame = frame.loc[:, list(columns)].copy(deep=True)
-        return key_frame.apply(
+def _canonical_row_scalar(value: Any) -> Any:
+    normalized = _normalize_scalar(value)
+    if isinstance(normalized, bool):
+        return {"type": "bool", "value": normalized}
+    if isinstance(normalized, float):
+        if not math.isfinite(normalized):
+            raise PartitionValidationError(
+                "Partition membership cannot fingerprint non-finite values."
+            )
+        return {"type": "number", "value": format(normalized, ".15g")}
+    if isinstance(normalized, int):
+        return {"type": "number", "value": str(normalized)}
+    if normalized is None:
+        return {"type": "null", "value": None}
+    return {"type": "string", "value": str(normalized)}
+
+
+def _row_content_fingerprints(
+    frame: pd.DataFrame,
+    *,
+    columns: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    selected_columns = tuple(columns) if columns is not None else tuple(frame.columns)
+    missing = [column for column in selected_columns if column not in frame.columns]
+    if missing:
+        raise PartitionValidationError(
+            f"Row fingerprint columns are missing: {missing}."
+        )
+    fingerprints: list[str] = []
+    for row in frame.loc[:, list(selected_columns)].itertuples(index=False, name=None):
+        payload = [
+            _canonical_row_scalar(value)
+            for value in row
+        ]
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        fingerprints.append(hashlib.sha256(encoded).hexdigest())
+    return tuple(fingerprints)
+
+
+def _source_identifier_membership_keys(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+) -> tuple[str, ...]:
+    if not columns:
+        raise ValueError("Source-identifier membership requires identifier columns.")
+    key_frame = frame.loc[:, list(columns)].copy(deep=True)
+    return tuple(
+        key_frame.apply(
             lambda row: json.dumps(
                 [_normalize_scalar(value) for value in row.tolist()],
                 ensure_ascii=False,
@@ -955,14 +1273,65 @@ def _stable_membership_key(frame: pd.DataFrame, columns: Sequence[str]) -> pd.Se
                 allow_nan=False,
             ),
             axis=1,
-        )
-    return pd.Series(
-        [
-            json.dumps(_normalize_scalar(value), ensure_ascii=False, allow_nan=False)
-            for value in frame.index.tolist()
-        ],
-        index=frame.index,
+        ).tolist()
     )
+
+
+def _technical_occurrence_membership_keys(frame: pd.DataFrame) -> tuple[str, ...]:
+    """Create source-order-bound occurrence tokens without inventing an ID.
+
+    Equal rows receive the same content hash and distinct occurrence ordinals.
+    The token is technical persistence evidence only; it is neither a predictor
+    nor evidence that two equal rows represent the same real-world entity.
+    """
+    occurrences: Counter[str] = Counter()
+    keys: list[str] = []
+    for row_hash in _row_content_fingerprints(frame):
+        occurrence = occurrences[row_hash]
+        occurrences[row_hash] += 1
+        keys.append(f"row-occurrence-v1:{row_hash}:{occurrence:08d}")
+    return tuple(keys)
+
+
+def _membership_contract(
+    frame: pd.DataFrame,
+    identifier_columns: Sequence[str],
+) -> tuple[tuple[str, ...], str, str]:
+    if identifier_columns:
+        return (
+            _source_identifier_membership_keys(frame, identifier_columns),
+            "source_identifier",
+            "declared source identifier tuple",
+        )
+    return (
+        _technical_occurrence_membership_keys(frame),
+        "technical_row_occurrence",
+        (
+            "source-order-bound full-row hash plus occurrence ordinal; technical "
+            "partition evidence only, not source or entity identity"
+        ),
+    )
+
+
+def _row_hash_from_occurrence_key(value: str) -> str:
+    prefix = "row-occurrence-v1:"
+    if not value.startswith(prefix):
+        raise PartitionValidationError(
+            "Invalid technical row-occurrence membership token."
+        )
+    remainder = value[len(prefix):]
+    row_hash, separator, ordinal = remainder.rpartition(":")
+    if (
+        not separator
+        or len(row_hash) != 64
+        or any(character not in "0123456789abcdef" for character in row_hash)
+        or len(ordinal) != 8
+        or not ordinal.isdigit()
+    ):
+        raise PartitionValidationError(
+            "Invalid technical row-occurrence membership token."
+        )
+    return row_hash
 
 
 def split_classification_dataset(
@@ -974,9 +1343,10 @@ def split_classification_dataset(
 ) -> DatasetPartitions:
     """Create deterministic stratified partitions with stable membership.
 
-    Rows are first ordered by the declared identifier key so membership does
-    not depend on incidental input ordering. Returned rows are then restored to
-    their original source positions within each partition.
+    Rows are ordered by declared source identifiers when present. Without an
+    identifier, a full-row hash plus source-order occurrence ordinal provides
+    technical, non-semantic membership evidence. Returned rows are restored to
+    source position within each partition.
     """
     frame = _copy_frame(dataframe)
     validate_split_policy(policy, known_columns=frame.columns)
@@ -994,9 +1364,10 @@ def split_classification_dataset(
 
     working = frame.copy(deep=True)
     working["__source_position__"] = range(len(working))
-    working["__membership_key__"] = _stable_membership_key(
-        working, identifier_columns
-    ).to_numpy()
+    source_membership, membership_kind, membership_semantics = _membership_contract(
+        frame, identifier_columns
+    )
+    working["__membership_key__"] = list(source_membership)
     if working["__membership_key__"].duplicated().any():
         raise SplitPolicyError("Membership keys must be unique before splitting.")
     canonical = working.sort_values(
@@ -1022,32 +1393,43 @@ def split_classification_dataset(
         stratify=temporary[policy.stratify_by],
     )
 
-    def project(positions: Sequence[int]) -> pd.DataFrame:
+    def project(positions: Sequence[int]) -> tuple[pd.DataFrame, tuple[str, ...]]:
         source_positions = sorted(
             int(value)
             for value in canonical.iloc[list(positions)]["__source_position__"].tolist()
         )
-        return frame.iloc[source_positions].copy(deep=True)
+        projected = frame.iloc[source_positions].copy(deep=True)
+        projected_membership = tuple(source_membership[position] for position in source_positions)
+        return projected, projected_membership
+
+    train, train_membership = project(train_positions)
+    validation, validation_membership = project(validation_positions)
+    test, test_membership = project(test_positions)
 
     return DatasetPartitions(
-        _train=project(train_positions),
-        _validation=project(validation_positions),
-        _test=project(test_positions),
+        _train=train,
+        _validation=validation,
+        _test=test,
         split_method=(
             "two_stage_sklearn_train_test_split_with_stratification_and_"
-            "identifier_sorted_membership"
+            + (
+                "identifier_sorted_membership"
+                if identifier_columns
+                else "technical_row_occurrence_sorted_membership"
+            )
         ),
         rounding_method=(
             "scikit-learn float test_size semantics: each held-out size is "
             "rounded up with ceil; the remainder is assigned to the first set"
         ),
+        _membership=(
+            ("train", train_membership),
+            ("validation", validation_membership),
+            ("test", test_membership),
+        ),
+        membership_kind=membership_kind,
+        membership_semantics=membership_semantics,
     )
-
-
-def _membership_values(
-    frame: pd.DataFrame, identifier_columns: Sequence[str]
-) -> tuple[str, ...]:
-    return tuple(_stable_membership_key(frame, identifier_columns).tolist())
 
 
 def validate_dataset_partitions(
@@ -1064,7 +1446,23 @@ def validate_dataset_partitions(
         raise ValueError("prevalence_tolerance cannot be negative.")
     source = _copy_frame(source_dataframe)
     partition_map = partitions.as_mapping()
-    source_membership = _membership_values(source, identifier_columns)
+    source_membership, inferred_kind, inferred_semantics = _membership_contract(
+        source, identifier_columns
+    )
+    membership_kind = (
+        partitions.membership_kind
+        if partitions.membership_kind != "unspecified"
+        else inferred_kind
+    )
+    membership_semantics = (
+        partitions.membership_semantics
+        if partitions.membership_semantics != "unspecified"
+        else inferred_semantics
+    )
+    if membership_kind != inferred_kind:
+        raise PartitionValidationError(
+            "Partition membership kind conflicts with the source identifier contract."
+        )
     source_membership_set = set(source_membership)
     if len(source_membership_set) != len(source):
         raise PartitionValidationError("Source membership identifiers are not unique.")
@@ -1077,6 +1475,12 @@ def validate_dataset_partitions(
     membership: list[tuple[str, tuple[str, ...]]] = []
     membership_sets: dict[str, set[str]] = {}
     source_position = {value: position for position, value in enumerate(source_membership)}
+    persisted_membership = partitions.membership_mapping()
+    if not persisted_membership and not identifier_columns:
+        raise PartitionValidationError(
+            "Technical row-occurrence membership evidence is required when the "
+            "source has no identifier columns."
+        )
 
     for name in ("train", "validation", "test"):
         frame = partition_map[name]
@@ -1092,12 +1496,40 @@ def validate_dataset_partitions(
             raise PartitionValidationError(
                 f"Partition '{name}' is missing expected classes: {absent}."
             )
-        values = _membership_values(frame, identifier_columns)
+        if persisted_membership:
+            values = tuple(persisted_membership.get(name, ()))
+        else:
+            values = _source_identifier_membership_keys(frame, identifier_columns)
+        if len(values) != len(frame):
+            raise PartitionValidationError(
+                f"Partition '{name}' membership count differs from its row count."
+            )
         values_set = set(values)
         if len(values_set) != len(frame):
             raise PartitionValidationError(
                 f"Partition '{name}' contains duplicate membership identifiers."
             )
+        unknown_values = [value for value in values if value not in source_position]
+        if unknown_values:
+            raise PartitionValidationError(
+                f"Partition '{name}' contains membership outside the source."
+            )
+        if identifier_columns:
+            observed_identifier_membership = _source_identifier_membership_keys(
+                frame, identifier_columns
+            )
+            if observed_identifier_membership != values:
+                raise PartitionValidationError(
+                    f"Partition '{name}' identifier membership does not match its rows."
+                )
+        else:
+            expected_hashes = Counter(_row_hash_from_occurrence_key(value) for value in values)
+            observed_hashes = Counter(_row_content_fingerprints(frame))
+            if observed_hashes != expected_hashes:
+                raise PartitionValidationError(
+                    f"Partition '{name}' row multiplicities do not match technical "
+                    "membership evidence."
+                )
         positions = [source_position[value] for value in values]
         if positions != sorted(positions):
             raise PartitionValidationError(
@@ -1147,13 +1579,24 @@ def validate_dataset_partitions(
     if sum(dict(row_counts).values()) != len(source):
         raise PartitionValidationError("Partition row counts do not cover the source.")
 
+    membership_checks = (
+        (
+            ("source_identifier_membership_disjoint", True),
+            ("entity_disjointness_validated", True),
+        )
+        if identifier_columns
+        else (
+            ("technical_occurrence_membership_disjoint", True),
+            ("row_multiplicity_preserved", True),
+            ("entity_disjointness_not_claimed_without_source_identifiers", True),
+        )
+    )
     checks = (
         ("all_partitions_present", True),
         ("all_classes_present", True),
         ("class_prevalence_within_tolerance", True),
-        ("indices_disjoint_by_membership", True),
-        ("customer_identifiers_disjoint", True),
-        ("no_shared_rows", True),
+        *membership_checks,
+        ("partition_membership_isolated", True),
         ("full_coverage", True),
         ("row_count_preserved", True),
         ("stable_source_order", True),
@@ -1166,7 +1609,131 @@ def validate_dataset_partitions(
         membership=tuple(membership),
         checks=checks,
         prevalence_tolerance=prevalence_tolerance,
+        membership_kind=membership_kind,
+        membership_semantics=membership_semantics,
+        entity_disjointness_status=(
+            "validated_from_source_identifiers"
+            if identifier_columns
+            else "not_claimed_without_source_identifiers"
+        ),
     )
+
+
+def analyze_repeated_profiles_across_partitions(
+    source_dataframe: pd.DataFrame,
+    partitions: DatasetPartitions,
+    *,
+    feature_columns: Sequence[str],
+    target_column: str,
+    identifier_columns: Sequence[str] = (),
+    max_samples: int = 20,
+) -> dict[str, Any]:
+    """Describe equality evidence without inferring duplicate entity identity."""
+    if max_samples < 0:
+        raise ValueError("max_samples cannot be negative.")
+    source = _copy_frame(source_dataframe)
+    features = tuple(feature_columns)
+    missing = [column for column in (*features, target_column) if column not in source]
+    if missing:
+        raise DatasetValidationError(
+            f"Repeated-profile analysis is missing columns: {missing}."
+        )
+
+    source_exact = Counter(_row_content_fingerprints(source))
+    source_profiles = Counter(
+        _row_content_fingerprints(source, columns=features)
+    )
+    partition_exact: dict[str, Counter[str]] = {}
+    partition_profiles: dict[str, Counter[str]] = {}
+    for name, frame in partitions.as_mapping().items():
+        partition_exact[name] = Counter(_row_content_fingerprints(frame))
+        partition_profiles[name] = Counter(
+            _row_content_fingerprints(frame, columns=features)
+        )
+
+    combined_exact: Counter[str] = Counter()
+    combined_profiles: Counter[str] = Counter()
+    for counter in partition_exact.values():
+        combined_exact.update(counter)
+    for counter in partition_profiles.values():
+        combined_profiles.update(counter)
+    if combined_exact != source_exact or combined_profiles != source_profiles:
+        raise PartitionValidationError(
+            "Repeated-profile multiplicities changed across partitions."
+        )
+
+    cross_partition_exact = {
+        row_hash: {
+            name: int(counts[row_hash])
+            for name, counts in partition_exact.items()
+            if counts[row_hash]
+        }
+        for row_hash, total in source_exact.items()
+        if total > 1
+        and sum(counts[row_hash] > 0 for counts in partition_exact.values()) > 1
+    }
+    cross_partition_profiles = {
+        profile_hash: {
+            name: int(counts[profile_hash])
+            for name, counts in partition_profiles.items()
+            if counts[profile_hash]
+        }
+        for profile_hash, total in source_profiles.items()
+        if total > 1
+        and sum(counts[profile_hash] > 0 for counts in partition_profiles.values()) > 1
+    }
+
+    profile_targets: defaultdict[str, set[str]] = defaultdict(set)
+    profile_hashes = _row_content_fingerprints(source, columns=features)
+    for profile_hash, target_value in zip(
+        profile_hashes,
+        source[target_column].tolist(),
+        strict=True,
+    ):
+        profile_targets[profile_hash].add(str(target_value))
+    target_conflict_profiles = {
+        key: sorted(values)
+        for key, values in profile_targets.items()
+        if len(values) > 1
+    }
+
+    def sample(mapping: Mapping[str, Mapping[str, int]]) -> list[dict[str, Any]]:
+        return [
+            {"profile_sha256": key, "partition_counts": dict(value)}
+            for key, value in sorted(mapping.items())[:max_samples]
+        ]
+
+    return {
+        "evidence_type": "repeated_profile_partition_review",
+        "source_identifier_available": bool(identifier_columns),
+        "identity_interpretation": (
+            "source_identifier_supported"
+            if identifier_columns
+            else (
+                "row equality is observational evidence only; duplicate entity "
+                "identity and same-grain leakage are not proven"
+            )
+        ),
+        "proven_duplicate_identity": False if not identifier_columns else None,
+        "source_exact_row_equality_group_count": int(
+            sum(count > 1 for count in source_exact.values())
+        ),
+        "source_exact_row_equality_row_count": int(
+            sum(count for count in source_exact.values() if count > 1)
+        ),
+        "source_repeated_feature_profile_group_count": int(
+            sum(count > 1 for count in source_profiles.values())
+        ),
+        "cross_partition_exact_row_equality_group_count": len(cross_partition_exact),
+        "cross_partition_repeated_feature_profile_group_count": len(
+            cross_partition_profiles
+        ),
+        "target_conflicting_feature_profile_group_count": len(target_conflict_profiles),
+        "exact_row_multiplicity_preserved": combined_exact == source_exact,
+        "feature_profile_multiplicity_preserved": combined_profiles == source_profiles,
+        "cross_partition_exact_row_samples": sample(cross_partition_exact),
+        "cross_partition_feature_profile_samples": sample(cross_partition_profiles),
+    }
 
 
 def _relative_posix(path: str | Path) -> str:
@@ -1203,6 +1770,7 @@ def build_preparation_manifest(
     source_sha256_after: str,
     deterministic_rules: Sequence[Mapping[str, Any]],
     readiness: Mapping[str, Any],
+    source_identity: Mapping[str, Any] | None = None,
     contract_version: str = CONTRACT_VERSION,
 ) -> dict[str, Any]:
     """Build a versioned preparation manifest."""
@@ -1238,6 +1806,7 @@ def build_preparation_manifest(
         },
         "runtime_versions": runtime_versions(),
         "readiness": _copy_mapping(readiness),
+        "source_identity_gate": _copy_mapping(source_identity or {}),
     }
 
 
@@ -1251,35 +1820,85 @@ def build_feature_manifest(
     categorical_expected_values: Mapping[str, Sequence[Any]],
     target_column: str,
     target_classes: Sequence[Any],
-    positive_target_class: Any,
-    target_encoding: Mapping[Any, int],
     expected_dtypes: Mapping[str, Any],
     preprocessing_contract: Mapping[str, Any],
     prohibited_predictors: Sequence[str],
+    positive_target_class: Any = None,
+    target_encoding: Mapping[Any, int] | None = None,
+    problem_type: str | None = None,
+    target_semantics: str | None = None,
 ) -> dict[str, Any]:
     """Build an ordered feature and future-preprocessing contract."""
-    return {
-        "schema_version": "feature-manifest.v1",
+    features = tuple(feature_columns)
+    numerical = tuple(numerical_features)
+    categorical = tuple(categorical_features)
+    identifiers = tuple(identifier_columns)
+    classes = tuple(target_classes)
+    if not classes:
+        raise ValueError("target_classes cannot be empty.")
+    if set(numerical) & set(categorical):
+        raise ValueError("Numerical and categorical feature roles overlap.")
+    if set((*numerical, *categorical)) != set(features):
+        raise ValueError(
+            "Numerical and categorical roles must cover feature_columns exactly."
+        )
+    resolved_problem_type = problem_type or (
+        "binary_classification" if len(classes) == 2 else "multiclass_classification"
+    )
+    if resolved_problem_type == "multiclass_classification" and positive_target_class is not None:
+        raise ValueError("Multiclass targets cannot declare a positive target class.")
+    if resolved_problem_type == "binary_classification" and len(classes) != 2:
+        raise ValueError("Binary classification requires exactly two target classes.")
+    encoding = (
+        dict(target_encoding)
+        if target_encoding is not None
+        else {value: index for index, value in enumerate(classes)}
+    )
+    if set(encoding) != set(classes) or set(encoding.values()) != set(range(len(classes))):
+        raise ValueError(
+            "target_encoding must map every target class bijectively to 0..n-1."
+        )
+    legacy_binary = (
+        problem_type is None
+        and target_semantics is None
+        and len(classes) == 2
+        and positive_target_class is not None
+    )
+    payload = {
+        "schema_version": (
+            "feature-manifest.v1" if legacy_binary else "feature-manifest.v2"
+        ),
         "artifact_type": "feature_manifest",
         "dataset_slug": dataset_slug,
-        "identifier_columns": list(identifier_columns),
-        "feature_columns": list(feature_columns),
-        "numerical_features": list(numerical_features),
-        "categorical_features": list(categorical_features),
+        "identifier_columns": list(identifiers),
+        "feature_columns": list(features),
+        "numerical_features": list(numerical),
+        "categorical_features": list(categorical),
         "categorical_expected_values": {
             column: list(values)
             for column, values in categorical_expected_values.items()
         },
         "target_column": target_column,
-        "target_classes": list(target_classes),
+        "target_classes": list(classes),
         "positive_target_class": positive_target_class,
         "target_encoding_contract": {
-            str(key): value for key, value in target_encoding.items()
+            str(key): value for key, value in encoding.items()
         },
         "expected_dtypes": _copy_mapping(expected_dtypes),
         "preprocessing_contract": _copy_mapping(preprocessing_contract),
         "prohibited_predictors": list(prohibited_predictors),
     }
+    if not legacy_binary:
+        payload["problem_type"] = resolved_problem_type
+        payload["target_contract"] = {
+            "semantics": target_semantics or "nominal_unordered",
+            "ordered_class_contract": list(classes),
+            "class_order_purpose": "deterministic technical contract, not ordinal rank",
+            "positive_class": positive_target_class,
+            "persisted_labels_remain_readable": True,
+            "encoding_required_for_persisted_target": False,
+        }
+    return payload
 
 
 def build_split_manifest(
@@ -1290,6 +1909,7 @@ def build_split_manifest(
     validation: PartitionValidationReport,
     partition_paths: Mapping[str, str | Path],
     partition_sha256: Mapping[str, str],
+    repeated_profile_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a versioned split manifest with explicit membership."""
     paths = {name: _relative_posix(path) for name, path in partition_paths.items()}
@@ -1297,8 +1917,13 @@ def build_split_manifest(
     if set(paths) != required or set(partition_sha256) != required:
         raise ValueError("Partition paths and fingerprints must cover train/validation/test.")
     report = validation.as_dict()
-    return {
-        "schema_version": "split-manifest.v1",
+    schema_version = (
+        "split-manifest.v2"
+        if report["membership_kind"] == "technical_row_occurrence"
+        else "split-manifest.v1"
+    )
+    payload = {
+        "schema_version": schema_version,
         "artifact_type": "split_manifest",
         "dataset_slug": dataset_slug,
         **policy.as_dict(),
@@ -1310,6 +1935,9 @@ def build_split_manifest(
         "class_counts": report["class_counts"],
         "class_prevalence": report["class_prevalence"],
         "membership": report["membership"],
+        "membership_kind": report["membership_kind"],
+        "membership_semantics": report["membership_semantics"],
+        "entity_disjointness_status": report["entity_disjointness_status"],
         "isolation_checks": report["checks"],
         "prevalence_tolerance": report["prevalence_tolerance"],
         "test_holdout_policy": (
@@ -1319,6 +1947,11 @@ def build_split_manifest(
         "operational_modeling_ready": False,
         "educational_model_selection_ready": True,
     }
+    if repeated_profile_evidence is not None:
+        payload["repeated_profile_evidence"] = _copy_mapping(
+            repeated_profile_evidence
+        )
+    return payload
 
 
 def build_quality_evidence(
@@ -1331,9 +1964,10 @@ def build_quality_evidence(
     fingerprints: Mapping[str, Any],
     readiness: Mapping[str, Any],
     preservation_checks: Mapping[str, Any],
+    repeated_profile_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build consolidated preparation quality evidence."""
-    return {
+    payload = {
         "schema_version": "quality-evidence.v1",
         "artifact_type": "preparation_quality_evidence",
         "dataset_slug": dataset_slug,
@@ -1346,9 +1980,61 @@ def build_quality_evidence(
         "readiness": _copy_mapping(readiness),
         "operational_block": {
             "operational_modeling_ready": False,
-            "operational_validity": "unconfirmed",
-            "temporal_contract_status": "unresolved",
-            "feature_inference_availability": "unconfirmed",
+            "operational_validity": readiness.get(
+                "operational_validity", "unconfirmed"
+            ),
+            "temporal_contract_status": readiness.get(
+                "temporal_contract_status", "unresolved"
+            ),
+            "feature_inference_availability": readiness.get(
+                "feature_inference_availability", "unconfirmed"
+            ),
+        },
+    }
+    if repeated_profile_evidence is not None:
+        payload["repeated_profile_evidence"] = _copy_mapping(
+            repeated_profile_evidence
+        )
+    return payload
+
+
+def build_preparation_handoff_manifest(
+    *,
+    dataset_slug: str,
+    component_paths: Mapping[str, str | Path],
+    component_payloads: Mapping[str, Mapping[str, Any]],
+    readiness: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a non-circular integrity index for preparation JSON components."""
+    required = {
+        "preparation_manifest",
+        "feature_manifest",
+        "split_manifest",
+        "quality_evidence",
+    }
+    if set(component_paths) != required or set(component_payloads) != required:
+        raise ValueError(
+            "Preparation handoff components must cover all four required manifests."
+        )
+    references = {
+        name: {
+            "path": _relative_posix(component_paths[name]),
+            "sha256": fingerprint_json_artifact(component_payloads[name]),
+            "schema_version": component_payloads[name].get("schema_version"),
+        }
+        for name in sorted(required)
+    }
+    return {
+        "schema_version": "preparation-handoff.v1",
+        "artifact_type": "preparation_handoff",
+        "dataset_slug": dataset_slug,
+        "components": references,
+        "readiness": _copy_mapping(readiness),
+        "consumer_contract": {
+            "prepared_and_partitions_are_frozen": True,
+            "model_selection_must_not_resplit": True,
+            "test_partition_sealed": True,
+            "test_partition_evaluated": False,
         },
     }
 
@@ -1447,17 +2133,7 @@ def write_preparation_artifacts(
                 staged.write_bytes(dataframe_csv_bytes(payload))
                 _validate_staged_csv(staged, payload)
             else:
-                staged.write_text(
-                    json.dumps(
-                        payload,
-                        ensure_ascii=False,
-                        indent=2,
-                        sort_keys=False,
-                        allow_nan=False,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
+                staged.write_bytes(json_artifact_bytes(payload))
                 json.loads(staged.read_text(encoding="utf-8"))
             staged_paths[relative] = staged
             digests[relative] = fingerprint_file(staged)
@@ -1553,26 +2229,94 @@ def _load_json_artifact(root: Path, relative_path: str | Path) -> dict[str, Any]
 def load_and_validate_preparation_handoff(
     *,
     project_root: str | Path,
-    preparation_manifest_path: str | Path,
-    feature_manifest_path: str | Path,
-    split_manifest_path: str | Path,
-    quality_evidence_path: str | Path,
+    preparation_handoff_path: str | Path | None = None,
+    preparation_manifest_path: str | Path | None = None,
+    feature_manifest_path: str | Path | None = None,
+    split_manifest_path: str | Path | None = None,
+    quality_evidence_path: str | Path | None = None,
 ) -> PreparationHandoff:
     """Load persisted artifacts, verify fingerprints, and return the handoff."""
     root = Path(project_root).expanduser().resolve()
+    handoff_manifest: dict[str, Any] | None = None
+    supplied_paths = {
+        "preparation_manifest": preparation_manifest_path,
+        "feature_manifest": feature_manifest_path,
+        "split_manifest": split_manifest_path,
+        "quality_evidence": quality_evidence_path,
+    }
+    if preparation_handoff_path is not None:
+        handoff_manifest = _load_json_artifact(root, preparation_handoff_path)
+        if handoff_manifest.get("schema_version") != "preparation-handoff.v1":
+            raise HandoffValidationError(
+                "Unexpected preparation handoff schema_version."
+            )
+        if handoff_manifest.get("artifact_type") != "preparation_handoff":
+            raise HandoffValidationError(
+                "Unexpected preparation handoff artifact_type."
+            )
+        components = handoff_manifest.get("components")
+        if not isinstance(components, Mapping) or set(components) != set(supplied_paths):
+            raise HandoffValidationError(
+                "Preparation handoff component references are incomplete."
+            )
+        resolved_paths: dict[str, str] = {}
+        for name, reference in components.items():
+            if not isinstance(reference, Mapping):
+                raise HandoffValidationError(
+                    f"Preparation handoff component '{name}' is invalid."
+                )
+            relative = reference.get("path")
+            expected_sha = reference.get("sha256")
+            if not isinstance(relative, str) or not isinstance(expected_sha, str):
+                raise HandoffValidationError(
+                    f"Preparation handoff component '{name}' lacks path or SHA-256."
+                )
+            component_file = _resolve_project_artifact_path(root, relative)
+            try:
+                observed_component_sha = fingerprint_file(component_file)
+            except FileNotFoundError as exc:
+                raise HandoffValidationError(
+                    f"Preparation handoff component is missing: {name}."
+                ) from exc
+            if observed_component_sha != expected_sha:
+                raise HandoffValidationError(
+                    f"Preparation handoff component fingerprint mismatch: {name}."
+                )
+            explicit = supplied_paths[name]
+            if explicit is not None and _relative_posix(explicit) != relative:
+                raise HandoffValidationError(
+                    f"Explicit path conflicts with preparation handoff: {name}."
+                )
+            resolved_paths[name] = relative
+        preparation_manifest_path = resolved_paths["preparation_manifest"]
+        feature_manifest_path = resolved_paths["feature_manifest"]
+        split_manifest_path = resolved_paths["split_manifest"]
+        quality_evidence_path = resolved_paths["quality_evidence"]
+    elif any(value is None for value in supplied_paths.values()):
+        raise ValueError(
+            "Supply preparation_handoff_path or all four legacy component paths."
+        )
+
+    assert preparation_manifest_path is not None
+    assert feature_manifest_path is not None
+    assert split_manifest_path is not None
+    assert quality_evidence_path is not None
     preparation_manifest = _load_json_artifact(root, preparation_manifest_path)
     feature_manifest = _load_json_artifact(root, feature_manifest_path)
     split_manifest = _load_json_artifact(root, split_manifest_path)
     quality_evidence = _load_json_artifact(root, quality_evidence_path)
 
-    expected_schemas = {
-        "preparation": (preparation_manifest, "preparation-manifest.v1"),
-        "feature": (feature_manifest, "feature-manifest.v1"),
-        "split": (split_manifest, "split-manifest.v1"),
-        "quality": (quality_evidence, "quality-evidence.v1"),
+    expected_schemas: dict[str, tuple[dict[str, Any], set[str]]] = {
+        "preparation": (preparation_manifest, {"preparation-manifest.v1"}),
+        "feature": (
+            feature_manifest,
+            {"feature-manifest.v1", "feature-manifest.v2"},
+        ),
+        "split": (split_manifest, {"split-manifest.v1", "split-manifest.v2"}),
+        "quality": (quality_evidence, {"quality-evidence.v1"}),
     }
     for name, (payload, expected) in expected_schemas.items():
-        if payload.get("schema_version") != expected:
+        if payload.get("schema_version") not in expected:
             raise HandoffValidationError(
                 f"Unexpected {name} schema_version: {payload.get('schema_version')!r}."
             )
@@ -1580,6 +2324,8 @@ def load_and_validate_preparation_handoff(
         payload.get("dataset_slug")
         for payload, _ in expected_schemas.values()
     }
+    if handoff_manifest is not None:
+        slugs.add(handoff_manifest.get("dataset_slug"))
     if len(slugs) != 1 or None in slugs:
         raise HandoffValidationError("Handoff dataset_slug values are inconsistent.")
     if split_manifest.get("operational_validity") != "unconfirmed":
@@ -1590,6 +2336,32 @@ def load_and_validate_preparation_handoff(
         raise HandoffValidationError(
             "Handoff operational_modeling_ready must remain false."
         )
+    if split_manifest.get("educational_model_selection_ready") is not True:
+        raise HandoffValidationError(
+            "Handoff educational_model_selection_ready must be true."
+        )
+    if feature_manifest.get("schema_version") == "feature-manifest.v2":
+        problem_type = feature_manifest.get("problem_type")
+        target_contract = feature_manifest.get("target_contract")
+        if problem_type not in {"binary_classification", "multiclass_classification"}:
+            raise HandoffValidationError("Feature manifest problem_type is invalid.")
+        if not isinstance(target_contract, Mapping):
+            raise HandoffValidationError("Feature manifest target_contract is invalid.")
+        if problem_type == "multiclass_classification":
+            if feature_manifest.get("positive_target_class") is not None:
+                raise HandoffValidationError(
+                    "Multiclass feature manifest cannot define a positive class."
+                )
+            if target_contract.get("semantics") != "nominal_unordered":
+                raise HandoffValidationError(
+                    "Multiclass target semantics must remain nominal and unordered."
+                )
+            if target_contract.get("ordered_class_contract") != feature_manifest.get(
+                "target_classes"
+            ):
+                raise HandoffValidationError(
+                    "Multiclass ordered class contract is inconsistent."
+                )
 
     prepared_relative = preparation_manifest.get("prepared_path")
     partition_paths = split_manifest.get("partition_paths")
@@ -1642,6 +2414,21 @@ def load_and_validate_preparation_handoff(
         _test=loaded_partitions["test"],
         split_method=str(split_manifest.get("split_method")),
         rounding_method=str(split_manifest.get("rounding_method")),
+        _membership=tuple(
+            (
+                name,
+                tuple(split_manifest.get("membership", {}).get(name, ())),
+            )
+            for name in ("train", "validation", "test")
+        ),
+        membership_kind=str(
+            split_manifest.get("membership_kind", "source_identifier")
+        ),
+        membership_semantics=str(
+            split_manifest.get(
+                "membership_semantics", "declared source identifier tuple"
+            )
+        ),
     )
     validate_dataset_partitions(
         prepared,
@@ -1652,12 +2439,42 @@ def load_and_validate_preparation_handoff(
         prevalence_tolerance=float(split_manifest.get("prevalence_tolerance", 0.02)),
     )
 
-    manifests = (
+    fingerprints = quality_evidence.get("fingerprint_checks", {})
+    if isinstance(fingerprints, Mapping):
+        quality_prepared_sha = fingerprints.get("prepared_sha256")
+        if quality_prepared_sha is not None and quality_prepared_sha != expected_prepared_sha:
+            raise HandoffValidationError(
+                "Prepared SHA-256 differs between preparation and quality artifacts."
+            )
+        quality_partition_sha = fingerprints.get("partition_sha256")
+        if quality_partition_sha is not None and quality_partition_sha != partition_sha:
+            raise HandoffValidationError(
+                "Partition SHA-256 values differ between split and quality artifacts."
+            )
+    quality_readiness = quality_evidence.get("readiness", {})
+    preparation_readiness = preparation_manifest.get("readiness", {})
+    for readiness in (quality_readiness, preparation_readiness):
+        if readiness.get("educational_model_selection_ready") is not True:
+            raise HandoffValidationError(
+                "Preparation readiness does not enable educational model selection."
+            )
+        if (
+            "test_partition_evaluated" in readiness
+            and readiness.get("test_partition_evaluated") is not False
+        ):
+            raise HandoffValidationError(
+                "Preparation handoff must declare the test partition unevaluated."
+            )
+
+    manifest_items: list[tuple[str, Mapping[str, Any]]] = [
         ("preparation_manifest", preparation_manifest),
         ("feature_manifest", feature_manifest),
         ("split_manifest", split_manifest),
         ("quality_evidence", quality_evidence),
-    )
+    ]
+    if handoff_manifest is not None:
+        manifest_items.append(("preparation_handoff", handoff_manifest))
+    manifests = tuple(manifest_items)
     return PreparationHandoff(
         _prepared=prepared,
         _train=loaded_partitions["train"],
