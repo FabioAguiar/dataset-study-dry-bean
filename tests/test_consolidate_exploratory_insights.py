@@ -10,6 +10,7 @@ import pytest
 from scripts.consolidate_exploratory_insights import (
     ExploratoryInsightsConsolidationError,
     consolidate_key_exploratory_insights,
+    consolidate_key_exploratory_insights_from_reports,
 )
 
 
@@ -624,3 +625,187 @@ def test_empty_consolidation_is_valid_and_modeling_ready() -> None:
     assert report.is_ready_for_preparation_decisions
     assert report.is_ready_for_modeling
     assert report.insights_frame().empty
+
+
+def _dry_bean_report_bundle(*, direct_leakage: bool = False, with_outliers: bool = True):
+    from types import SimpleNamespace
+
+    quality_report = SimpleNamespace(
+        findings_frame=lambda: pd.DataFrame(columns=["Finding ID", "Status"]),
+        blockers_frame=lambda: pd.DataFrame(columns=["Finding ID"]),
+        validated_non_issues_frame=lambda: pd.DataFrame(
+            [{"Non-issue ID": "NIS-001"}]
+        ),
+    )
+
+    target_report = SimpleNamespace(
+        target="Class",
+        class_count=7,
+        majority_classes=("DERMASON",),
+        minority_classes=("BOMBAY",),
+        imbalance_ratio=3.1,
+        normalized_class_entropy=0.95,
+    )
+
+    outlier_summary = (
+        pd.DataFrame(
+            [
+                {"Feature": "Area", "Outlier count": 4},
+                {"Feature": "Perimeter", "Outlier count": 2},
+            ]
+        )
+        if with_outliers
+        else pd.DataFrame(columns=["Feature", "Outlier count"])
+    )
+    numerical_report = SimpleNamespace(
+        features_with_outliers=("Area", "Perimeter") if with_outliers else (),
+        outlier_summary_frame=lambda: outlier_summary.copy(deep=True),
+    )
+
+    relationship_review = pd.DataFrame(
+        [
+            {
+                "Feature A": "Area",
+                "Feature B": "EquivDiameter",
+                "Maximum absolute association": 0.98,
+                "Potential redundancy": True,
+            }
+        ]
+    )
+    feature_relationship_report = SimpleNamespace(
+        redundancy_review_threshold=0.90,
+        numerical_review_frame=lambda: relationship_review.copy(deep=True),
+    )
+
+    target_relationships = pd.DataFrame(
+        [
+            {
+                "Feature": "Area",
+                "Maximum association": 0.42,
+                "Review flag": True,
+            },
+            {
+                "Feature": "Perimeter",
+                "Maximum association": 0.31,
+                "Review flag": True,
+            },
+        ]
+    )
+    feature_target_report = SimpleNamespace(
+        requested_features=("Area", "Perimeter", "EquivDiameter", "Compactness"),
+        association_review_threshold=0.10,
+        relationships_frame=lambda: target_relationships.copy(deep=True),
+    )
+
+    pairwise = pd.DataFrame(
+        [
+            {
+                "Class A": "DERMASON",
+                "Class B": "SIRA",
+                "Mean IQR overlap coefficient": 0.72,
+                "RMS robust median gap": 0.44,
+            }
+        ]
+    )
+    class_profile_report = SimpleNamespace(
+        pca_explained_variance_ratio=(0.45, 0.23),
+        pairwise_overlap_frame=lambda: pairwise.copy(deep=True),
+    )
+
+    dependencies = pd.DataFrame(
+        [
+            {
+                "Derived feature": "EquivDiameter",
+                "Dependency status": "Confirmed from retained columns",
+            },
+            {
+                "Derived feature": "Compactness",
+                "Dependency status": "Confirmed from retained columns",
+            },
+        ]
+    )
+    proxies = (
+        pd.DataFrame([{"Candidate feature": "proxy"}])
+        if direct_leakage
+        else pd.DataFrame(columns=["Candidate feature"])
+    )
+    leakage_report = SimpleNamespace(
+        candidate_features=("Area", "Perimeter", "EquivDiameter", "Compactness"),
+        has_direct_target_leakage=direct_leakage,
+        confirmed_derived_dependency_count=2,
+        dependency_frame=lambda: dependencies.copy(deep=True),
+        target_proxy_candidates_frame=lambda: proxies.copy(deep=True),
+    )
+
+    return {
+        "available_fields": ("Area", "Perimeter", "EquivDiameter", "Compactness", "Class"),
+        "quality_report": quality_report,
+        "target_report": target_report,
+        "numerical_report": numerical_report,
+        "feature_relationship_report": feature_relationship_report,
+        "feature_target_report": feature_target_report,
+        "class_profile_report": class_profile_report,
+        "leakage_report": leakage_report,
+    }
+
+
+def test_report_backed_consolidation_builds_multiclass_insights() -> None:
+    report = consolidate_key_exploratory_insights_from_reports(
+        **_dry_bean_report_bundle()
+    )
+
+    assert report.is_structurally_valid
+    assert report.is_ready_for_preparation_decisions
+    assert report.is_ready_for_modeling
+    assert set(report.insights_frame()["Insight ID"]) == {
+        "INS-001",
+        "INS-002",
+        "INS-003",
+        "INS-004",
+        "INS-005",
+        "INS-006",
+        "INS-007",
+    }
+    assert set(report.hypotheses_frame()["Hypothesis ID"]) == {"HYP-001", "HYP-002"}
+    assert set(report.validation_actions_frame()["Action ID"]) == {"VAL-001", "VAL-002"}
+
+
+def test_report_backed_consolidation_omits_outlier_insight_when_absent() -> None:
+    report = consolidate_key_exploratory_insights_from_reports(
+        **_dry_bean_report_bundle(with_outliers=False)
+    )
+
+    assert "INS-003" not in set(report.insights_frame()["Insight ID"])
+
+
+def test_report_backed_consolidation_blocks_modeling_on_direct_leakage() -> None:
+    report = consolidate_key_exploratory_insights_from_reports(
+        **_dry_bean_report_bundle(direct_leakage=True)
+    )
+
+    leakage = report.insights_frame().set_index("Insight ID").loc["INS-007"]
+    assert leakage["Status"] == "Unresolved"
+    assert leakage["Insight type"] == "Governance limitation"
+    assert not report.is_ready_for_modeling
+
+
+def test_compact_stage17_frames_are_not_full_contract_dumps() -> None:
+    report = consolidate_key_exploratory_insights_from_reports(
+        **_dry_bean_report_bundle()
+    )
+
+    assert list(report.exploratory_overview_frame().columns) == [
+        "Metric",
+        "Value",
+        "Interpretation",
+    ]
+    assert list(report.key_insights_frame().columns) == [
+        "Insight ID",
+        "Theme",
+        "Title",
+        "Relevance",
+        "Status",
+        "Summary",
+        "Modeling implication",
+        "Interpretation boundary",
+    ]

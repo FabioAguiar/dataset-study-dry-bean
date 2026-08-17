@@ -462,6 +462,30 @@ class KeyExploratoryInsightsReport:
         ]
         return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
 
+    def exploratory_overview_frame(self) -> pd.DataFrame:
+        """Return a compact stage-17 overview without claiming model performance."""
+        high_count = int(self.insights["Relevance"].eq("High").sum()) if not self.insights.empty else 0
+        rows = [
+            {"Metric": "Key exploratory insights", "Value": len(self.insights), "Interpretation": "Evidence-backed conclusions synthesized from prior stages"},
+            {"Metric": "High-relevance insights", "Value": high_count, "Interpretation": "Insights prioritized for downstream validation"},
+            {"Metric": "Exploratory hypotheses", "Value": len(self.hypotheses), "Interpretation": "Testable explanations deferred to later notebooks"},
+            {"Metric": "Validation actions", "Value": len(self.validation_actions), "Interpretation": "Planned checks linked to exploratory hypotheses"},
+            {"Metric": "Interpretation limitations", "Value": len(self.limitations), "Interpretation": "Boundaries that prevent overclaiming from EDA"},
+            {"Metric": "Structural consolidation valid", "Value": self.is_structurally_valid, "Interpretation": "Insight, evidence, and reference contracts are coherent"},
+            {"Metric": "Ready for preparation decisions", "Value": self.is_ready_for_preparation_decisions, "Interpretation": "Stage-17 evidence can inform preparation decisions"},
+        ]
+        return pd.DataFrame(rows, columns=_SUMMARY_COLUMNS)
+
+    def key_insights_frame(self) -> pd.DataFrame:
+        """Return the concise insight view intended for notebooks."""
+        columns = [
+            "Insight ID", "Theme", "Title", "Relevance", "Status",
+            "Summary", "Modeling implication", "Interpretation boundary",
+        ]
+        if self.insights.empty:
+            return pd.DataFrame(columns=columns)
+        return self.insights.loc[:, columns].copy(deep=True)
+
     def insights_frame(self) -> pd.DataFrame:
         """Return a defensive copy of consolidated insights."""
         return self.insights.copy(deep=True)
@@ -798,6 +822,354 @@ def consolidate_key_exploratory_insights(
         limitations=limitations_frame,
         issues=issues_frame,
     )
+
+
+
+def consolidate_key_exploratory_insights_from_reports(
+    *,
+    available_fields: Sequence[object],
+    quality_report: object,
+    target_report: object,
+    numerical_report: object,
+    feature_relationship_report: object,
+    feature_target_report: object,
+    class_profile_report: object,
+    leakage_report: object,
+) -> KeyExploratoryInsightsReport:
+    """Build stage-17 insight contracts only from already-produced reports."""
+    fields = _unique_text_tuple(available_fields)
+    target = _text(getattr(target_report, "target", ""))
+
+    insights: list[dict[str, object]] = []
+    evidence: list[dict[str, object]] = []
+    hypotheses: list[dict[str, object]] = []
+    actions: list[dict[str, object]] = []
+    limitations: list[dict[str, object]] = []
+
+    def add(
+        insight_id: str,
+        *,
+        theme: str,
+        title: str,
+        insight_type: str,
+        affected_fields: Sequence[object],
+        relevance: str,
+        status: str,
+        stages: Sequence[object],
+        summary: str,
+        implication: str,
+        boundary: str,
+        evidence_kind: str,
+        source_report: str,
+        source_metric: str,
+        observed: object,
+        comparison: object = None,
+        direction: str = "",
+    ) -> None:
+        insights.append({
+            "insight_id": insight_id,
+            "theme": theme,
+            "title": title,
+            "insight_type": insight_type,
+            "affected_fields": tuple(affected_fields),
+            "relevance": relevance,
+            "status": status,
+            "source_stages": tuple(stages),
+            "summary": summary,
+            "modeling_implication": implication,
+            "interpretation_boundary": boundary,
+        })
+        evidence.append({
+            "evidence_id": f"EVI-{insight_id.split('-')[-1]}",
+            "insight_id": insight_id,
+            "evidence_kind": evidence_kind,
+            "source_report": source_report,
+            "source_metric": source_metric,
+            "observed_value": deepcopy(observed),
+            "comparison_value": deepcopy(comparison),
+            "direction": direction,
+            "interpretation": summary,
+        })
+
+    # Quality is a synthesis of stage 16, not a new audit.
+    findings = quality_report.findings_frame()
+    blockers = quality_report.blockers_frame()
+    non_issues = quality_report.validated_non_issues_frame()
+    add(
+        "INS-001",
+        theme="Data quality",
+        title="Structural data quality supports controlled preparation" if blockers.empty else "Data-quality conditions require targeted review",
+        insight_type="Data-quality condition",
+        affected_fields=fields,
+        relevance="High",
+        status="Observed" if blockers.empty else "Unresolved",
+        stages=("7", "8", "9", "16"),
+        summary=f"Stage 16 consolidated {len(findings)} findings, {len(blockers)} blockers, and {len(non_issues)} validated non-issues.",
+        implication="Restrict preparation to evidence-backed actions and preserve conditions already validated as non-issues.",
+        boundary="Structural data quality does not establish predictive performance.",
+        evidence_kind="Data quality",
+        source_report="quality_findings_report",
+        source_metric="Findings, blockers, validated non-issues",
+        observed={"findings": len(findings), "blockers": len(blockers), "validated_non_issues": len(non_issues)},
+        comparison={"blockers": 0},
+        direction="Controlled" if blockers.empty else "Review required",
+    )
+
+    # Target support.
+    ratio = getattr(target_report, "imbalance_ratio", None)
+    entropy = getattr(target_report, "normalized_class_entropy", None)
+    unequal = ratio is not None and float(ratio) > 1.05
+    add(
+        "INS-002",
+        theme="Target distribution",
+        title="Multiclass support is unequal across target classes" if unequal else "Multiclass support is broadly even across target classes",
+        insight_type="Pattern",
+        affected_fields=(target,) if target else (),
+        relevance="High",
+        status="Observed",
+        stages=("10",),
+        summary=(
+            f"The target contains {getattr(target_report, 'class_count', 0)} classes; "
+            f"majority={tuple(getattr(target_report, 'majority_classes', ())) or 'n/a'}, "
+            f"minority={tuple(getattr(target_report, 'minority_classes', ())) or 'n/a'}, "
+            f"majority/minority ratio={_format_metric(ratio)}, normalized entropy={_format_metric(entropy)}."
+        ),
+        implication="Use stratified partitions and macro/per-class metrics; do not infer a resampling requirement from class counts alone.",
+        boundary="Class frequency describes support, not class difficulty or model bias.",
+        evidence_kind="Target distribution",
+        source_report="target_report",
+        source_metric="Class support and normalized entropy",
+        observed={"imbalance_ratio": ratio, "normalized_entropy": entropy},
+        comparison={"uniform_entropy": 1.0},
+        direction="Unequal support" if unequal else "Broadly balanced",
+    )
+
+    # Distribution extremes only when observed.
+    outlier_features = tuple(getattr(numerical_report, "features_with_outliers", ()))
+    if outlier_features:
+        outlier_frame = numerical_report.outlier_summary_frame()
+        candidate_count = int(outlier_frame["Outlier count"].sum()) if "Outlier count" in outlier_frame else None
+        add(
+            "INS-003",
+            theme="Numerical distributions",
+            title="IQR candidates occur in numerical feature distributions",
+            insight_type="Pattern",
+            affected_fields=outlier_features,
+            relevance="Medium",
+            status="Observed",
+            stages=("11", "16"),
+            summary=f"{len(outlier_features)} features contain IQR review candidates (candidate flags={candidate_count if candidate_count is not None else 'n/a'}).",
+            implication="Keep raw observations and evaluate robustness or transformations only inside validated pipelines.",
+            boundary="IQR candidates are statistical extremes, not proven measurement errors.",
+            evidence_kind="Numerical pattern",
+            source_report="numerical_report",
+            source_metric="IQR outlier candidates",
+            observed={"features": outlier_features, "candidate_flags": candidate_count},
+            comparison=0,
+            direction="Review only",
+        )
+
+    # Redundancy + derived dependencies.
+    review_pairs = feature_relationship_report.numerical_review_frame()
+    redundant = (
+        review_pairs.loc[review_pairs["Potential redundancy"]].reset_index(drop=True)
+        if not review_pairs.empty and "Potential redundancy" in review_pairs
+        else pd.DataFrame()
+    )
+    confirmed = int(getattr(leakage_report, "confirmed_derived_dependency_count", 0))
+    if not redundant.empty or confirmed:
+        strongest_pair: tuple[str, str] = ()
+        strongest_value: object = None
+        if not review_pairs.empty:
+            first = review_pairs.iloc[0]
+            strongest_pair = (_text(first.get("Feature A")), _text(first.get("Feature B")))
+            strongest_value = first.get("Maximum absolute association")
+        dep_frame = leakage_report.dependency_frame()
+        derived_fields: tuple[str, ...] = ()
+        if not dep_frame.empty and "Dependency status" in dep_frame:
+            selected = dep_frame.loc[dep_frame["Dependency status"].eq("Confirmed from retained columns")]
+            if "Derived feature" in selected:
+                derived_fields = tuple(selected["Derived feature"].astype(str))
+        add(
+            "INS-004",
+            theme="Feature dependency",
+            title="Strong associations and derived measurements create structural redundancy",
+            insight_type="Dependency",
+            affected_fields=_unique_text_tuple((*strongest_pair, *derived_fields)),
+            relevance="High",
+            status="Observed",
+            stages=("12", "15"),
+            summary=(
+                f"{len(redundant)} feature pairs meet the redundancy-review threshold and "
+                f"{confirmed} derived dependencies are numerically confirmed. "
+                f"Strongest reviewed pair={strongest_pair or 'n/a'} ({_format_metric(strongest_value)})."
+            ),
+            implication="Use the complete validated feature set as a baseline, then compare regularized and ablated variants inside validation.",
+            boundary="Redundancy does not by itself justify feature removal before the split.",
+            evidence_kind="Feature dependency",
+            source_report="feature_relationship_report + leakage_report",
+            source_metric="Redundancy-review pairs and confirmed dependencies",
+            observed={"redundancy_pairs": len(redundant), "confirmed_dependencies": confirmed, "strongest_pair": strongest_pair, "strongest_association": strongest_value},
+            comparison={"redundancy_threshold": getattr(feature_relationship_report, "redundancy_review_threshold", None)},
+            direction="Structural redundancy",
+        )
+        hypotheses.append({
+            "hypothesis_id": "HYP-001",
+            "linked_insight_ids": ("INS-004",),
+            "title": "Some redundant features may add limited incremental value",
+            "hypothesis": "A reduced or regularized feature set may match the all-feature baseline without degrading multiclass performance.",
+            "status": "Unvalidated",
+            "confounding_risks": (),
+            "required_validation": "Compare all-feature, regularized, and ablated pipelines under the same cross-validation protocol.",
+            "decision_stage": "Model selection",
+        })
+        actions.append({
+            "action_id": "VAL-001",
+            "hypothesis_ids": ("HYP-001",),
+            "validation_type": "Ablation",
+            "action": "Compare the full feature set with dependency-aware ablation variants inside training folds.",
+            "stage": "Model selection",
+            "blocking": False,
+            "status": "Planned",
+            "acceptance_criteria": "Any removal is supported by stable held-out multiclass metrics across folds.",
+        })
+
+    # Univariate relationship with target.
+    rel = feature_target_report.relationships_frame()
+    if not rel.empty:
+        first = rel.iloc[0]
+        top_feature = _text(first.get("Feature"))
+        top_association = first.get("Maximum association")
+        review_count = int(rel["Review flag"].sum()) if "Review flag" in rel else 0
+        add(
+            "INS-005",
+            theme="Feature-to-target association",
+            title="Morphological features show measurable univariate multiclass association",
+            insight_type="Pattern",
+            affected_fields=tuple(feature_target_report.requested_features) + ((target,) if target else ()),
+            relevance="High",
+            status="Observed",
+            stages=("13",),
+            summary=f"{review_count} features meet the exploratory association threshold; strongest={top_feature or 'n/a'} ({_format_metric(top_association)}).",
+            implication="Retain the validated feature set for the baseline and evaluate incremental contribution jointly during model selection.",
+            boundary="Univariate association is not causality, incremental importance, or held-out predictive performance.",
+            evidence_kind="Feature-to-target",
+            source_report="feature_target_report",
+            source_metric="Maximum univariate multiclass association",
+            observed={"review_candidates": review_count, "top_feature": top_feature, "top_association": top_association},
+            comparison={"review_threshold": getattr(feature_target_report, "association_review_threshold", None)},
+            direction="Class-associated",
+        )
+
+    # Multivariate class overlap.
+    pairs = class_profile_report.pairwise_overlap_frame()
+    if not pairs.empty:
+        first = pairs.iloc[0]
+        pair = (_text(first.get("Class A")), _text(first.get("Class B")))
+        overlap = first.get("Mean IQR overlap coefficient")
+        gap = first.get("RMS robust median gap")
+        pca_variance = sum(float(v) for v in getattr(class_profile_report, "pca_explained_variance_ratio", (0.0, 0.0)))
+        add(
+            "INS-006",
+            theme="Class separation",
+            title="Some class pairs retain substantial central-profile overlap",
+            insight_type="Contrast",
+            affected_fields=tuple(feature_target_report.requested_features) + ((target,) if target else ()),
+            relevance="High",
+            status="Observed",
+            stages=("14",),
+            summary=f"Greatest central overlap={pair[0]} vs {pair[1]} (mean IQR overlap={_format_metric(overlap)}, robust median gap={_format_metric(gap)}); PCA-2D coverage={_format_percent(pca_variance)}.",
+            implication="Evaluate confusion matrices, macro metrics, and per-class recall because class-specific difficulty may differ.",
+            boundary="Profile overlap and PCA proximity do not estimate classifier confusion.",
+            evidence_kind="Feature-to-target",
+            source_report="class_profile_report",
+            source_metric="Greatest class-IQR overlap and PCA coverage",
+            observed={"pair": pair, "mean_iqr_overlap": overlap, "robust_median_gap": gap, "pca_two_component_variance": pca_variance},
+            direction="Overlap",
+        )
+        hypotheses.append({
+            "hypothesis_id": "HYP-002",
+            "linked_insight_ids": ("INS-006",),
+            "title": "High-overlap class pairs may concentrate predictive errors",
+            "hypothesis": "Pairs with greater exploratory profile overlap may show more mutual confusion after modeling.",
+            "status": "Unvalidated",
+            "confounding_risks": ("Model family", "Decision boundary"),
+            "required_validation": "Inspect repeated-validation confusion matrices and per-class precision/recall for the highest-overlap pairs.",
+            "decision_stage": "Model evaluation",
+        })
+        actions.append({
+            "action_id": "VAL-002",
+            "hypothesis_ids": ("HYP-002",),
+            "validation_type": "Error analysis",
+            "action": "Compare held-out model confusion with the exploratory class-pair overlap ranking from stage 14.",
+            "stage": "Model evaluation",
+            "blocking": False,
+            "status": "Planned",
+            "acceptance_criteria": "Any class-confusion claim is supported by held-out confusion matrices and per-class metrics.",
+        })
+
+    # Target leakage / governance.
+    direct_leakage = bool(getattr(leakage_report, "has_direct_target_leakage", False))
+    proxy_count = len(leakage_report.target_proxy_candidates_frame())
+    add(
+        "INS-007",
+        theme="Leakage governance",
+        title="Direct target leakage requires resolution" if direct_leakage else "No direct target leakage was detected in candidate features",
+        insight_type="Governance limitation" if direct_leakage else "Data-quality condition",
+        affected_fields=tuple(getattr(leakage_report, "candidate_features", ())) + ((target,) if target else ()),
+        relevance="High",
+        status="Unresolved" if direct_leakage else "Controlled",
+        stages=("15", "16"),
+        summary=f"Direct target leakage={direct_leakage}; target proxy candidates={proxy_count}; confirmed non-target derived dependencies={getattr(leakage_report, 'confirmed_derived_dependency_count', 0)}.",
+        implication="Resolve target-derived proxies before modeling." if direct_leakage else "Keep target semantics isolated and preserve leakage-safe fitting rules.",
+        boundary="Absence of direct proxies does not replace train/validation isolation for learned transformations.",
+        evidence_kind="Leakage/governance",
+        source_report="leakage_report",
+        source_metric="Direct target leakage audit",
+        observed={"direct_target_leakage": direct_leakage, "target_proxy_candidates": proxy_count},
+        comparison={"direct_target_leakage": False},
+        direction="Blocked" if direct_leakage else "Controlled",
+    )
+
+    limitations.append({
+        "limitation_id": "LIM-001",
+        "theme": "Exploratory interpretation",
+        "title": "EDA associations do not establish classifier performance",
+        "limitation_type": "Modeling",
+        "affected_fields": tuple(feature_target_report.requested_features) + ((target,) if target else ()),
+        "severity": "Contextual",
+        "status": "Accepted",
+        "source_stages": ("12", "13", "14", "17"),
+        "implication": "Correlation, eta squared, overlap, and PCA patterns cannot be reported as out-of-sample predictive performance.",
+        "required_resolution": "Validate predictive claims with leakage-safe cross-validation and held-out multiclass metrics.",
+    })
+
+    return consolidate_key_exploratory_insights(
+        available_fields=fields,
+        insights=insights,
+        evidence=evidence,
+        hypotheses=hypotheses,
+        validation_actions=actions,
+        limitations=limitations,
+    )
+
+
+def _format_metric(value: object) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_percent(value: object) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.2%}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _normalize_insights(
