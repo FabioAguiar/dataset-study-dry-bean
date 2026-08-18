@@ -289,7 +289,7 @@ class FeatureTargetRelationshipReport:
                     else int(self.numerical_relationships["Review flag"].sum())
                 ),
                 "Interpretation": (
-                    "Effect size or churn-rate spread meets an exploratory "
+                    "Effect size or target-rate spread meets an exploratory "
                     "threshold"
                 ),
             },
@@ -303,7 +303,7 @@ class FeatureTargetRelationshipReport:
                     )
                 ),
                 "Interpretation": (
-                    "Association or churn-rate spread meets an exploratory "
+                    "Association or target-rate spread meets an exploratory "
                     "threshold"
                 ),
             },
@@ -1086,7 +1086,7 @@ def _analyze_categorical_feature(
     if cramers_v is None:
         interpretation = "Insufficient variation for categorical association"
     elif review:
-        interpretation = "Category churn rates merit modeling review"
+        interpretation = "Category target rates merit modeling review"
     elif cramers_v >= association_threshold / 2:
         interpretation = "Limited-to-moderate categorical target association"
     else:

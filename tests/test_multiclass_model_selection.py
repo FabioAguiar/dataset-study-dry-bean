@@ -17,6 +17,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 
 import scripts.select_models as sm
+from scripts.prepare_data import _technical_occurrence_membership_keys
 
 
 CLASSES = ("SEKER", "BARBUNYA", "BOMBAY", "CALI", "DERMASON", "HOROZ", "SIRA")
@@ -343,18 +344,171 @@ def test_repeated_profile_sensitivity_is_non_destructive(roles):
     assert "does not prove" in result["interpretation"]
 
 
-def _copy_preparation_boundary(destination: Path) -> None:
-    source_root = Path(__file__).resolve().parents[1]
-    shutil.copytree(
-        source_root / "artifacts/preparation/dry-bean",
-        destination / "artifacts/preparation/dry-bean",
-        dirs_exist_ok=True,
+def _write_json(path: Path, payload: dict) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return sm.sha256_file(path)
+
+
+def _materialize_preparation_boundary(root: Path) -> None:
+    feature_columns = [
+        "Area",
+        "Perimeter",
+        "MajorAxisLength",
+        "MinorAxisLength",
+        "AspectRatio",
+        "Eccentricity",
+        "ConvexArea",
+        "EquivDiameter",
+        "Extent",
+        "Solidity",
+        "Roundness",
+        "Compactness",
+        "ShapeFactor1",
+        "ShapeFactor2",
+        "ShapeFactor3",
+        "ShapeFactor4",
+    ]
+    target_encoding = {label: index for index, label in enumerate(CLASSES)}
+    frame = pd.DataFrame(
+        [
+            {**{column: float(i + offset) for column in feature_columns}, "Class": label}
+            for offset, label in enumerate(CLASSES)
+            for i in range(3)
+        ],
+        columns=[*feature_columns, "Class"],
     )
-    shutil.copytree(
-        source_root / "data/processed/dry-bean",
-        destination / "data/processed/dry-bean",
-        dirs_exist_ok=True,
-    )
+    processed = root / "data/processed/dry-bean"
+    split_dir = processed / "splits/stratified-70-15-15-seed-42"
+    processed.mkdir(parents=True, exist_ok=True)
+    split_dir.mkdir(parents=True, exist_ok=True)
+    prepared_path = processed / "prepared.csv"
+    train_path = split_dir / "train.csv"
+    validation_path = split_dir / "validation.csv"
+    test_path = split_dir / "test.csv"
+    train = frame.groupby("Class", sort=False).head(1).reset_index(drop=True)
+    validation = frame.groupby("Class", sort=False).nth(1).reset_index(drop=True)
+    test = frame.groupby("Class", sort=False).nth(2).reset_index(drop=True)
+    frame.to_csv(prepared_path, index=False)
+    train.to_csv(train_path, index=False)
+    validation.to_csv(validation_path, index=False)
+    test.to_csv(test_path, index=False)
+    source_membership = _technical_occurrence_membership_keys(frame)
+    partition_membership = {
+        "train": source_membership[0::3],
+        "validation": source_membership[1::3],
+        "test": source_membership[2::3],
+    }
+
+    artifact_root = root / "artifacts/preparation/dry-bean"
+    feature_manifest = {
+        "schema_version": "feature-manifest.v2",
+        "artifact_type": "feature_manifest",
+        "dataset_slug": "dry-bean",
+        "feature_columns": feature_columns,
+        "numerical_features": feature_columns,
+        "categorical_features": [],
+        "identifier_columns": [],
+        "target_column": "Class",
+        "target_classes": list(CLASSES),
+        "target_encoding_contract": target_encoding,
+        "target_contract": {
+            "semantics": "nominal_unordered",
+            "ordered_class_contract": list(CLASSES),
+        },
+        "positive_target_class": None,
+        "problem_type": "multiclass_classification",
+    }
+    split_manifest = {
+        "schema_version": "split-manifest.v2",
+        "artifact_type": "split_manifest",
+        "dataset_slug": "dry-bean",
+        "partition_paths": {
+            "train": "data/processed/dry-bean/splits/stratified-70-15-15-seed-42/train.csv",
+            "validation": "data/processed/dry-bean/splits/stratified-70-15-15-seed-42/validation.csv",
+            "test": "data/processed/dry-bean/splits/stratified-70-15-15-seed-42/test.csv",
+        },
+        "partition_sha256": {
+            "train": sm.sha256_file(train_path),
+            "validation": sm.sha256_file(validation_path),
+            "test": sm.sha256_file(test_path),
+        },
+        "row_counts": {"train": 7, "validation": 7, "test": 7},
+        "split_method": "synthetic_stratified_snapshot",
+        "rounding_method": "synthetic",
+        "membership": {
+            name: list(values) for name, values in partition_membership.items()
+        },
+        "membership_kind": "technical_row_occurrence",
+        "membership_semantics": "synthetic test fixture",
+        "operational_validity": "unconfirmed",
+        "operational_modeling_ready": False,
+        "educational_model_selection_ready": True,
+        "prevalence_tolerance": 1.0,
+    }
+    preparation_manifest = {
+        "schema_version": "preparation-manifest.v1",
+        "artifact_type": "preparation_manifest",
+        "dataset_slug": "dry-bean",
+        "source_path": "data/raw/dry-bean/dataset.csv",
+        "prepared_path": "data/processed/dry-bean/prepared.csv",
+        "prepared_sha256": sm.sha256_file(prepared_path),
+        "source_row_count": 21,
+        "prepared_row_count": 21,
+        "source_column_count": 17,
+        "prepared_column_count": 17,
+        "column_order": [*feature_columns, "Class"],
+        "readiness": {
+            "educational_model_selection_ready": True,
+            "test_partition_evaluated": False,
+        },
+    }
+    quality_evidence = {
+        "schema_version": "quality-evidence.v1",
+        "artifact_type": "preparation_quality_evidence",
+        "dataset_slug": "dry-bean",
+        "fingerprint_checks": {
+            "prepared_sha256": sm.sha256_file(prepared_path),
+            "partition_sha256": split_manifest["partition_sha256"],
+        },
+        "readiness": {
+            "educational_model_selection_ready": True,
+            "test_partition_evaluated": False,
+        },
+    }
+    component_payloads = {
+        "feature_manifest": (
+            "artifacts/preparation/dry-bean/feature-manifest.json",
+            feature_manifest,
+        ),
+        "preparation_manifest": (
+            "artifacts/preparation/dry-bean/preparation-manifest.json",
+            preparation_manifest,
+        ),
+        "quality_evidence": (
+            "artifacts/preparation/dry-bean/quality-evidence.json",
+            quality_evidence,
+        ),
+        "split_manifest": (
+            "artifacts/preparation/dry-bean/split-manifest.json",
+            split_manifest,
+        ),
+    }
+    components = {}
+    for name, (relative, payload) in component_payloads.items():
+        components[name] = {
+            "path": relative,
+            "sha256": _write_json(root / relative, payload),
+            "schema_version": payload["schema_version"],
+        }
+    handoff = {
+        "schema_version": "preparation-handoff.v1",
+        "artifact_type": "preparation_handoff",
+        "dataset_slug": "dry-bean",
+        "components": components,
+        "readiness": {"educational_model_selection_ready": True, "test_partition_sealed": True},
+    }
+    _write_json(artifact_root / "preparation-handoff.json", handoff)
 
 
 def _v2_artifact_set(root: Path) -> dict[str, object]:
@@ -436,7 +590,7 @@ def _v2_artifact_set(root: Path) -> dict[str, object]:
 
 
 def test_v2_atomic_write_loader_and_no_final_model(tmp_path):
-    _copy_preparation_boundary(tmp_path)
+    _materialize_preparation_boundary(tmp_path)
     output = tmp_path / "artifacts/model-selection/dry-bean"
     artifacts = _v2_artifact_set(tmp_path)
     result = sm.write_multiclass_model_selection_artifacts(output_directory=output, artifacts=artifacts)
@@ -454,7 +608,7 @@ def test_v2_atomic_write_loader_and_no_final_model(tmp_path):
 
 
 def test_v2_semantic_idempotence_and_conflict(tmp_path):
-    _copy_preparation_boundary(tmp_path)
+    _materialize_preparation_boundary(tmp_path)
     output = tmp_path / "artifacts/model-selection/dry-bean"
     first = _v2_artifact_set(tmp_path)
     sm.write_multiclass_model_selection_artifacts(output_directory=output, artifacts=first)
@@ -462,6 +616,44 @@ def test_v2_semantic_idempotence_and_conflict(tmp_path):
     second["candidate-results.json"]["duration_seconds"] = 999
     result = sm.write_multiclass_model_selection_artifacts(output_directory=output, artifacts=second)
     assert result.idempotent is True
+    legacy_text = _v2_artifact_set(tmp_path)
+    for filename in ("model-selection-handoff.json", "selection-analysis.json"):
+        payload = legacy_text[filename]
+        rendered = json.loads(
+            json.dumps(payload).replace(
+                "Repeated-profile evidence does not prove duplicate identity or leakage",
+                "repeated profiles do not prove duplicate identity or leakage",
+            )
+        )
+        legacy_text[filename] = rendered
+    legacy_text["model-selection-manifest.json"]["limitations"] = [
+        (
+            "Repeated-profile analysis is sensitivity evidence and does not prove duplicate identity or leakage."
+            if value == "Repeated-profile evidence does not prove duplicate identity or leakage."
+            else value
+        )
+        for value in legacy_text["model-selection-manifest.json"]["limitations"]
+    ]
+    result = sm.write_multiclass_model_selection_artifacts(
+        output_directory=output, artifacts=legacy_text
+    )
+    assert result.idempotent is True
+    stale_manifest = json.loads((output / "model-selection-manifest.json").read_text())
+    stale_manifest["artifact_fingerprints"]["model-selection-handoff.json"][
+        "semantic_sha256"
+    ] = "0" * 64
+    stale_manifest["artifact_fingerprints"]["selection-analysis.json"][
+        "byte_sha256"
+    ] = "1" * 64
+    stale_manifest["self_semantic_sha256"] = "2" * 64
+    (output / "model-selection-manifest.json").write_text(
+        json.dumps(stale_manifest, indent=2, sort_keys=True)
+    )
+    refreshed = sm.write_multiclass_model_selection_artifacts(
+        output_directory=output, artifacts=_v2_artifact_set(tmp_path)
+    )
+    assert refreshed.idempotent is False
+    assert "model-selection-manifest.json" in refreshed.replaced
     divergent = _v2_artifact_set(tmp_path)
     divergent["model-selection-handoff.json"]["selected_feature_policy"] = "different"
     with pytest.raises(sm.ArtifactConflictError, match="divergent"):
@@ -469,7 +661,7 @@ def test_v2_semantic_idempotence_and_conflict(tmp_path):
 
 
 def test_v2_partial_set_and_fingerprint_mismatch_fail_closed(tmp_path):
-    _copy_preparation_boundary(tmp_path)
+    _materialize_preparation_boundary(tmp_path)
     output = tmp_path / "artifacts/model-selection/dry-bean"
     output.mkdir(parents=True)
     (output / "candidate-results.json").write_text("{}")
@@ -501,7 +693,7 @@ def test_v2_partial_set_and_fingerprint_mismatch_fail_closed(tmp_path):
     ],
 )
 def test_v2_loader_rejects_cross_contract_inconsistency(tmp_path, field, value):
-    _copy_preparation_boundary(tmp_path)
+    _materialize_preparation_boundary(tmp_path)
     output = tmp_path / "artifacts/model-selection/dry-bean"
     artifacts = _v2_artifact_set(tmp_path)
     artifacts["model-selection-handoff.json"][field] = value
@@ -515,11 +707,79 @@ def test_v2_loader_rejects_cross_contract_inconsistency(tmp_path, field, value):
         )
 
 
-def test_v1_telco_handoff_remains_loadable():
-    root = Path(__file__).resolve().parents[1]
+def test_v1_binary_handoff_remains_loadable(tmp_path):
+    directory = tmp_path / "artifacts/model-selection/binary"
+    directory.mkdir(parents=True)
+    handoff = {
+        "schema_version": "model-selection-handoff.v1",
+        "artifact_type": "model_selection_handoff",
+        "dataset_slug": "synthetic-binary",
+        "target_classes": ["No", "Yes"],
+        "target_encoding": {"No": 0, "Yes": 1},
+        "positive_class": "Yes",
+        "selected_model_id": "hist_gradient_boosting",
+        "selected_model_family": "HistGradientBoostingClassifier",
+        "test_partition_sealed": True,
+        "test_partition_evaluated": False,
+        "final_model_trained": False,
+        "model_artifact": None,
+        "model_artifact_materialized": False,
+        "model_bundle_materialized": False,
+        "operational_modeling_ready": False,
+        "operational_validity": "unconfirmed",
+        "operational_threshold": "unresolved",
+        "readiness": {
+            "educational_model_selection_completed": True,
+            "educational_final_candidate_selected": True,
+            "educational_threshold_selected": True,
+            "model_selection_handoff_ready": True,
+            "final_model_training_ready": True,
+        },
+    }
+    payloads = {
+        "candidate-results.json": {
+            "schema_version": "candidate-results.v1",
+            "artifact_type": "candidate_results",
+            "dataset_slug": "synthetic-binary",
+        },
+        "cross-validation-results.csv": pd.DataFrame([{"model_id": "hist_gradient_boosting"}]),
+        "validation-evidence.json": {
+            "schema_version": "validation-evidence.v1",
+            "artifact_type": "validation_evidence",
+            "dataset_slug": "synthetic-binary",
+        },
+        "threshold-analysis.json": {
+            "schema_version": "threshold-analysis.v1",
+            "artifact_type": "threshold_analysis",
+            "dataset_slug": "synthetic-binary",
+        },
+        "model-selection-handoff.json": handoff,
+    }
+    fingerprints = {}
+    for filename, payload in payloads.items():
+        path = directory / filename
+        if isinstance(payload, pd.DataFrame):
+            payload.to_csv(path, index=False)
+            loaded = pd.read_csv(path)
+        else:
+            _write_json(path, payload)
+            loaded = payload
+        fingerprints[filename] = {
+            "byte_sha256": sm.sha256_file(path),
+            "semantic_sha256": sm._semantic_fingerprint_value(filename, loaded),
+        }
+    _write_json(
+        directory / "model-selection-manifest.json",
+        {
+            "schema_version": "model-selection-manifest.v1",
+            "artifact_type": "model_selection_manifest",
+            "dataset_slug": "synthetic-binary",
+            "artifact_fingerprints": fingerprints,
+        },
+    )
     loaded = sm.load_and_validate_model_selection_handoff(
-        project_root=root,
-        handoff_path="artifacts/model-selection/telco-customer-churn/model-selection-handoff.json",
+        project_root=tmp_path,
+        handoff_path="artifacts/model-selection/binary/model-selection-handoff.json",
     )
     assert loaded["schema_version"] == "model-selection-handoff.v1"
     assert loaded["positive_class"] is not None

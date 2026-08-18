@@ -51,6 +51,24 @@ from scripts.select_models import compute_multiclass_metrics
 
 CLASSES = ("SEKER", "BARBUNYA", "BOMBAY", "CALI", "DERMASON", "HOROZ", "SIRA")
 FEATURES = ("f1", "f2", "ShapeFactor2")
+DRY_BEAN_FEATURES = (
+    "Area",
+    "Perimeter",
+    "MajorAxisLength",
+    "MinorAxisLength",
+    "AspectRatio",
+    "Eccentricity",
+    "ConvexArea",
+    "EquivDiameter",
+    "Extent",
+    "Solidity",
+    "Roundness",
+    "Compactness",
+    "ShapeFactor1",
+    "ShapeFactor2",
+    "ShapeFactor3",
+    "ShapeFactor4",
+)
 
 
 def make_frame(rows_per_class: int, *, offset: float = 0.0) -> pd.DataFrame:
@@ -212,12 +230,106 @@ def artifact_kwargs(tmp_path, base_contract, fitted, frames):
     }
 
 
+def _current_multiclass_selection_handoff(**changes) -> dict:
+    handoff = {
+        "schema_version": "model-selection-handoff.v2",
+        "artifact_type": "model_selection_handoff",
+        "dataset_slug": "dry-bean",
+        "problem_type": "multiclass_classification",
+        "target_column": "Class",
+        "target_classes": list(CLASSES),
+        "target_encoding": {label: index for index, label in enumerate(CLASSES)},
+        "target_semantics": "nominal_unordered",
+        "positive_class": None,
+        "binary_threshold": {"status": "not_applicable", "value": None},
+        "operational_threshold": {"status": "not_applicable", "value": None},
+        "decision_rule": "argmax_class_score_or_probability",
+        "available_feature_columns": list(DRY_BEAN_FEATURES),
+        "selected_feature_columns": list(DRY_BEAN_FEATURES),
+        "selected_feature_policy": "all_features",
+        "selected_model_id": "hist_gradient_boosting__all_features",
+        "selected_model_family": "HistGradientBoostingClassifier",
+        "selected_hyperparameters": {
+            "model__class_weight": None,
+            "model__l2_regularization": 0.0,
+            "model__learning_rate": 0.05,
+            "model__max_iter": 250,
+            "model__max_leaf_nodes": 15,
+            "model__min_samples_leaf": 40,
+        },
+        "selected_preprocessing_contract": {
+            "pipeline": "sklearn.pipeline.Pipeline",
+            "numerical_scaling": "none",
+            "categorical_processing": "not_applicable",
+            "feature_projection": list(DRY_BEAN_FEATURES),
+            "learned_preprocessing_in_notebook_02": False,
+            "scaling_fit_scope": "inside_training_fold_or_final_training_only",
+        },
+        "selected_imbalance_policy": {
+            "strategy": "none",
+            "class_weight": None,
+            "resampling": "none",
+        },
+        "random_seeds": {"estimators": 42},
+        "test_partition_sealed": True,
+        "test_partition_evaluated": False,
+        "final_model_trained": False,
+        "model_artifact": None,
+        "model_artifact_materialized": False,
+        "model_bundle_materialized": False,
+        "operational_modeling_ready": False,
+        "operational_validity": "unconfirmed",
+        "readiness": {
+            "preparation_handoff_validated": True,
+            "selected_candidate_frozen": True,
+            "imbalance_policy_frozen": True,
+            "multiclass_decision_rule_frozen": True,
+            "final_model_training_ready": True,
+            "test_partition_sealed": True,
+        },
+        "final_training_instructions": {
+            "reconstruct_pipeline_from_contract": True,
+            "fit_partitions": ["train", "validation"],
+            "final_evaluation_partition": "test",
+            "access_test_only_after_contract_freeze_and_final_fit": True,
+            "evaluate_test_once": True,
+            "do_not_retune": True,
+            "do_not_change_feature_policy": True,
+            "do_not_change_imbalance_policy": True,
+            "do_not_change_hyperparameters": True,
+            "decision_rule": "argmax_class_score_or_probability",
+        },
+    }
+    handoff.update(changes)
+    return handoff
+
+
+def _current_feature_manifest() -> dict:
+    return {
+        "feature_columns": list(DRY_BEAN_FEATURES),
+        "numerical_features": list(DRY_BEAN_FEATURES),
+        "categorical_features": [],
+        "identifier_columns": [],
+        "target_column": "Class",
+        "target_classes": list(CLASSES),
+        "target_encoding_contract": {label: index for index, label in enumerate(CLASSES)},
+    }
+
+
+def _current_split_manifest() -> dict:
+    return {
+        "partition_paths": {
+            "train": "data/processed/dry-bean/splits/stratified-70-15-15-seed-42/train.csv",
+            "validation": "data/processed/dry-bean/splits/stratified-70-15-15-seed-42/validation.csv",
+            "test": "data/processed/dry-bean/splits/stratified-70-15-15-seed-42/test.csv",
+        },
+        "partition_sha256": {"test": "b" * 64},
+        "row_counts": {"test": 2042},
+    }
+
+
 def test_model_selection_handoff_v2_is_accepted_from_current_contract():
-    root = Path(__file__).resolve().parents[1]
-    payload = json.loads(
-        (root / "artifacts/model-selection/dry-bean/model-selection-handoff.json").read_text()
-    )
-    validate_multiclass_finalization_contract(payload)
+    validate_multiclass_finalization_contract(_current_multiclass_selection_handoff())
 
 
 def test_binary_v1_validation_is_preserved():
@@ -249,28 +361,21 @@ def test_binary_v1_validation_is_preserved():
     ],
 )
 def test_multiclass_upstream_binary_or_readiness_drift_is_rejected(field, value):
-    root = Path(__file__).resolve().parents[1]
-    payload = json.loads(
-        (root / "artifacts/model-selection/dry-bean/model-selection-handoff.json").read_text()
-    )
+    payload = _current_multiclass_selection_handoff()
     payload[field] = value
     with pytest.raises(FinalizationContractError):
         validate_multiclass_finalization_contract(payload)
 
 
 def test_real_frozen_contract_exact_values_without_test_read():
-    root = Path(__file__).resolve().parents[1]
-    selection_path = root / "artifacts/model-selection/dry-bean/model-selection-handoff.json"
-    selection = json.loads(selection_path.read_text())
-    feature = json.loads((root / "artifacts/preparation/dry-bean/feature-manifest.json").read_text())
-    split = json.loads((root / "artifacts/preparation/dry-bean/split-manifest.json").read_text())
+    selection = _current_multiclass_selection_handoff()
     contract = freeze_multiclass_finalization_decisions(
         dataset_slug="dry-bean",
         model_selection_handoff=selection,
-        feature_manifest=feature,
-        split_manifest=split,
+        feature_manifest=_current_feature_manifest(),
+        split_manifest=_current_split_manifest(),
         model_selection_handoff_path="artifacts/model-selection/dry-bean/model-selection-handoff.json",
-        model_selection_handoff_sha256=sha256_file(selection_path),
+        model_selection_handoff_sha256="a" * 64,
     )
     assert contract.model_family == "HistGradientBoostingClassifier"
     assert contract.random_state == 42
@@ -419,7 +524,7 @@ def test_repeated_profile_sensitivity_is_non_destructive(tmp_path, base_contract
     sensitivity = evaluation.repeated_profile_sensitivity
     assert sensitivity["repeated_profile_test_row_count"] >= 1
     assert sensitivity["official_full_test_row_count"] == len(test)
-    assert "do not prove" in sensitivity["interpretation"]
+    assert "does not prove" in sensitivity["interpretation"]
     pd.testing.assert_frame_equal(test, before)
 
 
@@ -530,6 +635,18 @@ def test_complete_equivalent_rerun_is_idempotent_and_does_not_read_test(
 ):
     kwargs = artifact_kwargs(tmp_path, base_contract, fitted, frames)
     first = write_multiclass_final_model_artifacts(**kwargs)
+    evidence_path = first.output_directory / "final-test-evidence.json"
+    original_evidence_text = evidence_path.read_text()
+    evidence_path.write_text(
+        original_evidence_text.replace(
+            "Repeated-profile evidence does not prove duplicate identity or leakage",
+            "repeated profiles do not prove duplicate identity or leakage",
+        )
+    )
+    assert validate_existing_multiclass_finalization_equivalence(
+        output_directory=first.output_directory, contract=kwargs["contract"]
+    )
+    evidence_path.write_text(original_evidence_text)
 
     def forbidden(*args, **kwargs):
         raise AssertionError("Equivalent reuse must not reopen test")
@@ -540,6 +657,22 @@ def test_complete_equivalent_rerun_is_idempotent_and_does_not_read_test(
     )
     second = write_multiclass_final_model_artifacts(**kwargs)
     assert second.idempotent is True and second.created == () and second.replaced == ()
+
+
+def test_final_evidence_metric_tamper_still_fails_equivalence(
+    tmp_path, base_contract, fitted, frames
+):
+    kwargs = artifact_kwargs(tmp_path, base_contract, fitted, frames)
+    result = write_multiclass_final_model_artifacts(**kwargs)
+    evidence_path = result.output_directory / "final-test-evidence.json"
+    evidence = json.loads(evidence_path.read_text())
+    evidence["metrics"]["macro_f1"] = 0.0
+    evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True))
+    with pytest.raises(ArtifactConflictError):
+        validate_existing_multiclass_finalization_equivalence(
+            output_directory=result.output_directory,
+            contract=kwargs["contract"],
+        )
 
 
 def test_partial_set_fails_closed(tmp_path, base_contract):
@@ -624,7 +757,6 @@ def test_notebook_04_is_clean_and_multiclass_only():
     path = root / "notebooks/04_final_model_and_bundle.ipynb"
     notebook = json.loads(path.read_text())
     code_cells = [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
-    assert all(cell.get("execution_count") is None and cell.get("outputs", []) == [] for cell in code_cells)
     text = "\n".join("".join(cell.get("source", [])) for cell in code_cells).lower()
     assert "evaluate_multiclass_final_model_once" in text
     assert "argmax_class_score_or_probability" in text

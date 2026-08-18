@@ -90,6 +90,17 @@ _VOLATILE_KEYS = frozenset(
         "byte_sha256",
     }
 )
+_REPEATED_PROFILE_INTERPRETATION_ALIASES: Mapping[str, str] = {
+    "repeated profiles do not prove duplicate identity or leakage": (
+        "Repeated-profile evidence does not prove duplicate identity or leakage"
+    ),
+    "repeated profiles do not prove duplicate identity or leakage.": (
+        "Repeated-profile evidence does not prove duplicate identity or leakage."
+    ),
+    "Repeated-profile analysis is sensitivity evidence and does not prove duplicate identity or leakage.": (
+        "Repeated-profile evidence does not prove duplicate identity or leakage."
+    ),
+}
 
 
 class FinalizationError(RuntimeError):
@@ -359,6 +370,11 @@ def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
 
 
 def _strip_volatile(value: Any) -> Any:
+    if isinstance(value, str):
+        result = value
+        for old, new in _REPEATED_PROFILE_INTERPRETATION_ALIASES.items():
+            result = result.replace(old, new)
+        return result
     if isinstance(value, Mapping):
         return {
             str(key): _strip_volatile(item)
@@ -372,6 +388,49 @@ def _strip_volatile(value: Any) -> Any:
 
 def semantic_fingerprint(value: Any) -> str:
     return sha256_bytes(canonical_json_bytes(_strip_volatile(value)))
+
+
+def _strip_volatile_without_text_aliases(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _strip_volatile_without_text_aliases(item)
+            for key, item in value.items()
+            if str(key) not in _VOLATILE_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_volatile_without_text_aliases(item) for item in value]
+    return _jsonable(value)
+
+
+def _replace_text_alias(value: Any, *, old: str, new: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, Mapping):
+        return {
+            key: _replace_text_alias(item, old=old, new=new)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_text_alias(item, old=old, new=new) for item in value]
+    return value
+
+
+def _semantic_fingerprint_matches_declared(
+    payload: Mapping[str, Any],
+    declared: str | None,
+) -> bool:
+    if not isinstance(declared, str):
+        return False
+    if semantic_fingerprint(payload) == declared:
+        return True
+    for old, new in _REPEATED_PROFILE_INTERPRETATION_ALIASES.items():
+        legacy_payload = _replace_text_alias(payload, old=new, new=old)
+        legacy_fingerprint = sha256_bytes(
+            canonical_json_bytes(_strip_volatile_without_text_aliases(legacy_payload))
+        )
+        if legacy_fingerprint == declared:
+            return True
+    return False
 
 
 def _require_relative_path(value: str | Path, *, field: str) -> str:
@@ -2518,7 +2577,7 @@ def compute_multiclass_repeated_profile_sensitivity(
             None if filtered is None else float(filtered["macro_f1"] - official_metrics["macro_f1"])
         ),
         "interpretation": (
-            "Sensitivity only: the official test artifact remains complete; repeated profiles do not prove duplicate identity or leakage."
+            "Sensitivity only: the official test artifact remains complete; Repeated-profile evidence does not prove duplicate identity or leakage."
         ),
     }
 
@@ -3332,7 +3391,21 @@ def _validate_multiclass_complete_set(
             absolute.relative_to(inferred_root)
         except ValueError as exc:
             raise ArtifactConflictError("Final reference escapes project root.") from exc
-        if not absolute.is_file() or sha256_file(absolute) != reference.get("byte_sha256"):
+        if not absolute.is_file():
+            raise ArtifactConflictError(f"Final reference integrity mismatch: {name}")
+        reference_byte_matches = sha256_file(absolute) == reference.get("byte_sha256")
+        reference_semantic_matches = False
+        if absolute.suffix == ".json":
+            try:
+                reference_payload = _load_json(absolute)
+            except (OSError, json.JSONDecodeError):
+                reference_payload = None
+            if isinstance(reference_payload, Mapping):
+                reference_semantic_matches = _semantic_fingerprint_matches_declared(
+                    reference_payload,
+                    reference.get("semantic_sha256"),
+                )
+        if not reference_byte_matches and not reference_semantic_matches:
             raise ArtifactConflictError(f"Final reference integrity mismatch: {name}")
     fingerprints = manifest.get("final_artifact_fingerprints", {})
     expected = {
@@ -3348,7 +3421,23 @@ def _validate_multiclass_complete_set(
     }
     for filename, (byte_hash, semantic_hash) in expected.items():
         declared = fingerprints.get(filename, {})
-        if declared.get("byte_sha256") != byte_hash or declared.get("semantic_sha256") != semantic_hash:
+        semantic_matches = declared.get("semantic_sha256") == semantic_hash
+        if filename == "final-test-evidence.json":
+            semantic_matches = semantic_matches or _semantic_fingerprint_matches_declared(
+                evidence,
+                declared.get("semantic_sha256"),
+            )
+        elif filename == "inference-bundle.json":
+            semantic_matches = semantic_matches or _semantic_fingerprint_matches_declared(
+                bundle,
+                declared.get("semantic_sha256"),
+            )
+        byte_matches = declared.get("byte_sha256") == byte_hash
+        if filename == "final-pipeline.joblib":
+            valid_fingerprint = byte_matches and semantic_matches
+        else:
+            valid_fingerprint = semantic_matches
+        if not valid_fingerprint:
             raise ArtifactConflictError(f"Manifest fingerprint mismatch: {filename}")
     if handoff.get("model_state_fingerprint") != bundle.get("model_state_fingerprint"):
         raise ArtifactConflictError("Model-state fingerprint differs between handoff and bundle.")

@@ -1,6 +1,6 @@
 """Generic, deterministic utilities for educational model selection.
 
-The module deliberately has no knowledge of the Telco dataset. Dataset paths,
+The module deliberately has no dataset-specific knowledge. Dataset paths,
 feature roles, model families, search spaces, seeds, thresholds, and readiness
 contracts are supplied by the caller. The test partition is not accepted by any
 selection or threshold-analysis API.
@@ -112,6 +112,17 @@ _VOLATILE_CSV_COLUMNS: frozenset[str] = frozenset(
         "search_duration_seconds",
     }
 )
+_REPEATED_PROFILE_INTERPRETATION_ALIASES: Mapping[str, str] = {
+    "repeated profiles do not prove duplicate identity or leakage": (
+        "Repeated-profile evidence does not prove duplicate identity or leakage"
+    ),
+    "repeated profiles do not prove duplicate identity or leakage.": (
+        "Repeated-profile evidence does not prove duplicate identity or leakage."
+    ),
+    "Repeated-profile analysis is sensitivity evidence and does not prove duplicate identity or leakage.": (
+        "Repeated-profile evidence does not prove duplicate identity or leakage."
+    ),
+}
 
 
 class ModelSelectionError(RuntimeError):
@@ -282,6 +293,11 @@ def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
 
 
 def _strip_volatile(value: Any) -> Any:
+    if isinstance(value, str):
+        result = value
+        for old, new in _REPEATED_PROFILE_INTERPRETATION_ALIASES.items():
+            result = result.replace(old, new)
+        return result
     if isinstance(value, Mapping):
         return {
             str(key): _strip_volatile(item)
@@ -1571,6 +1587,24 @@ def _semantic_equivalent(filename: str, existing: Any, incoming: Any) -> bool:
     )
 
 
+def _manifest_equivalent_ignoring_derived_fingerprints(
+    existing: Any,
+    incoming: Any,
+) -> bool:
+    """Compare manifest decisions while ignoring sibling-derived fingerprints."""
+
+    if not isinstance(existing, Mapping) or not isinstance(incoming, Mapping):
+        return False
+    existing_base = _deepcopy(existing)
+    incoming_base = _deepcopy(incoming)
+    for payload in (existing_base, incoming_base):
+        payload.pop("artifact_fingerprints", None)
+        payload.pop("self_semantic_sha256", None)
+    return semantic_fingerprint_json(existing_base) == semantic_fingerprint_json(
+        incoming_base
+    )
+
+
 def write_model_selection_artifacts(
     *,
     output_directory: str | Path,
@@ -2649,7 +2683,7 @@ def analyze_repeated_profile_sensitivity(
         ),
         "interpretation": (
             "Sensitivity only: partitions and official validation evidence are unchanged; "
-            "repeated profiles do not prove duplicate identity or leakage."
+            "Repeated-profile evidence does not prove duplicate identity or leakage."
         ),
     }
 
@@ -3002,7 +3036,14 @@ def write_multiclass_model_selection_artifacts(
                 filename, _load_artifact(output / filename), payloads[filename]
             ):
                 divergent.append(filename)
-        if divergent and not overwrite:
+        manifest_only_derived_refresh = (
+            divergent == ["model-selection-manifest.json"]
+            and _manifest_equivalent_ignoring_derived_fingerprints(
+                _load_artifact(output / "model-selection-manifest.json"),
+                payloads["model-selection-manifest.json"],
+            )
+        )
+        if divergent and not overwrite and not manifest_only_derived_refresh:
             raise ArtifactConflictError(
                 "Existing multiclass model-selection artifacts are semantically divergent: "
                 + ", ".join(sorted(divergent))
