@@ -30,6 +30,7 @@ from sklearn.utils.validation import check_is_fitted
 
 from scripts.finalize_model import (
     load_and_validate_final_model_handoff,
+    load_and_validate_final_model_manifest,
     load_and_validate_inference_bundle,
     load_trusted_pipeline_from_bundle,
 )
@@ -248,7 +249,58 @@ def _require_mapping(value: Any, *, field: str) -> Mapping[str, Any]:
     return value
 
 
-def validate_inference_readiness(
+def _schema_version(
+    payload: Mapping[str, Any], *, artifact: str, v1_schema: str, v2_schema: str
+) -> str:
+    """Return a supported schema, retaining legacy schema-less v1 test fixtures."""
+
+    observed = payload.get("schema_version")
+    if observed is None:
+        return v1_schema
+    if observed not in {v1_schema, v2_schema}:
+        raise InferenceContractError(
+            f"Unsupported {artifact} schema: {observed!r}."
+        )
+    return str(observed)
+
+
+def _inference_bundle_schema(bundle: Mapping[str, Any]) -> str:
+    return _schema_version(
+        bundle,
+        artifact="inference bundle",
+        v1_schema="inference-bundle.v1",
+        v2_schema="inference-bundle.v2",
+    )
+
+
+def _final_handoff_schema(handoff: Mapping[str, Any]) -> str:
+    return _schema_version(
+        handoff,
+        artifact="final-model handoff",
+        v1_schema="final-model-handoff.v1",
+        v2_schema="final-model-handoff.v2",
+    )
+
+
+def _validate_matching_schema_generations(
+    handoff: Mapping[str, Any], bundle: Mapping[str, Any]
+) -> str:
+    handoff_schema = _final_handoff_schema(handoff)
+    bundle_schema = _inference_bundle_schema(bundle)
+    generations = {
+        "final-model-handoff.v1": "v1",
+        "final-model-handoff.v2": "v2",
+        "inference-bundle.v1": "v1",
+        "inference-bundle.v2": "v2",
+    }
+    if generations[handoff_schema] != generations[bundle_schema]:
+        raise InferenceContractError(
+            "Final-model handoff and inference bundle use different schema generations."
+        )
+    return generations[bundle_schema]
+
+
+def _validate_inference_readiness_v1(
     handoff: Mapping[str, Any], bundle: Mapping[str, Any]
 ) -> None:
     """Validate educational readiness while preserving all operational limitations."""
@@ -316,7 +368,78 @@ def validate_inference_readiness(
         )
 
 
-def validate_bundle_handoff_alignment(
+def validate_multiclass_inference_readiness(
+    handoff: Mapping[str, Any], bundle: Mapping[str, Any]
+) -> None:
+    """Validate the educational-only readiness contract of genuine v2 artifacts."""
+
+    if _validate_matching_schema_generations(handoff, bundle) != "v2":
+        raise InferenceContractError("Multiclass readiness requires v2 artifacts.")
+    handoff_requirements = {
+        "educational_final_model_completed": True,
+        "final_model_trained": True,
+        "final_test_evaluation_completed": True,
+        "model_artifact_materialized": True,
+        "model_bundle_materialized": True,
+        "final_model_handoff_ready": True,
+        "educational_inference_demo_ready": True,
+        "test_partition_evaluation_count": 1,
+        "test_partition_used_for_adjustment": False,
+        "no_model_selection_decision_changed_after_test": True,
+        "operational_modeling_ready": False,
+        "operational_validity": "unconfirmed",
+        "api_implemented": False,
+    }
+    for field, expected in handoff_requirements.items():
+        observed = handoff.get(field)
+        if observed != expected:
+            raise InferenceContractError(
+                f"Multiclass handoff readiness mismatch for {field}: "
+                f"expected={expected!r}, observed={observed!r}"
+            )
+
+    readiness = _require_mapping(bundle.get("readiness"), field="bundle.readiness")
+    for field, expected in {
+        "educational_inference_demo_ready": True,
+        "model_artifact_materialized": True,
+        "model_bundle_materialized": True,
+        "serialization_reload_validated": True,
+        "inference_smoke_test_completed": True,
+        "operational_modeling_ready": False,
+    }.items():
+        observed = readiness.get(field)
+        if observed != expected:
+            raise InferenceContractError(
+                f"Multiclass bundle readiness mismatch for {field}: "
+                f"expected={expected!r}, observed={observed!r}"
+            )
+    if bundle.get("operational_modeling_ready") is not False:
+        raise InferenceContractError("Operational modeling readiness must remain false.")
+    if bundle.get("operational_validity") != "unconfirmed":
+        raise InferenceContractError("Operational validity must remain unconfirmed.")
+    output = _require_mapping(
+        bundle.get("inference_output_contract"),
+        field="bundle.inference_output_contract",
+    )
+    if output.get("operational_prediction_available") is not False:
+        raise InferenceContractError(
+            "The multiclass bundle must preserve operational_prediction_available=false."
+        )
+
+
+def validate_inference_readiness(
+    handoff: Mapping[str, Any], bundle: Mapping[str, Any]
+) -> None:
+    """Dispatch educational readiness validation by artifact schema generation."""
+
+    generation = _validate_matching_schema_generations(handoff, bundle)
+    if generation == "v1":
+        _validate_inference_readiness_v1(handoff, bundle)
+        return
+    validate_multiclass_inference_readiness(handoff, bundle)
+
+
+def _validate_bundle_handoff_alignment_v1(
     handoff: Mapping[str, Any],
     bundle: Mapping[str, Any],
     *,
@@ -378,6 +501,126 @@ def validate_bundle_handoff_alignment(
                 f"{manifest_field}={manifest.get(manifest_field)!r}, "
                 f"{bundle_field}={bundle.get(bundle_field)!r}"
             )
+
+
+def validate_multiclass_bundle_handoff_alignment(
+    handoff: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any] | None = None,
+) -> None:
+    """Validate v2 identity, input, class-order, model, and runtime alignment."""
+
+    if _validate_matching_schema_generations(handoff, bundle) != "v2":
+        raise InferenceContractError("Multiclass alignment requires v2 artifacts.")
+    pairs = (
+        ("dataset_slug", "dataset_slug"),
+        ("problem_type", "problem_type"),
+        ("selected_model_id", "model_id"),
+        ("selected_model_family", "model_family"),
+        ("model_state_fingerprint", "model_state_fingerprint"),
+        ("feature_order", "feature_columns"),
+        ("target_column", "target_column"),
+        ("target_classes", "target_classes"),
+        ("target_semantics", "target_semantics"),
+        ("selected_hyperparameters", "selected_hyperparameters"),
+        ("preprocessing", "preprocessing_contract"),
+        ("imbalance_policy", "imbalance_policy"),
+        ("decision_rule", "decision_rule"),
+        ("estimator_class_order", "estimator_class_order"),
+        ("output_class_order", "output_class_order"),
+    )
+    for handoff_field, bundle_field in pairs:
+        if handoff.get(handoff_field) != bundle.get(bundle_field):
+            raise InferenceContractError(
+                "Multiclass handoff/bundle mismatch: "
+                f"{handoff_field}={handoff.get(handoff_field)!r}, "
+                f"{bundle_field}={bundle.get(bundle_field)!r}"
+            )
+    classes = list(bundle.get("target_classes", ()))
+    estimator_order = list(bundle.get("estimator_class_order", ()))
+    output_order = list(bundle.get("output_class_order", ()))
+    if len(classes) < 3 or len(set(map(str, classes))) != len(classes):
+        raise InferenceContractError("Multiclass target classes must be unique.")
+    if set(estimator_order) != set(classes) or set(output_order) != set(classes):
+        raise InferenceContractError("Multiclass estimator/output class sets differ.")
+    output_contract = _require_mapping(
+        bundle.get("inference_output_contract"),
+        field="bundle.inference_output_contract",
+    )
+    if output_contract.get("class_order") != output_order:
+        raise InferenceContractError("Output contract class order differs from bundle.")
+    if output_contract.get("decision_rule") != bundle.get("decision_rule"):
+        raise InferenceContractError("Output contract decision rule differs from bundle.")
+
+    references = _require_mapping(
+        handoff.get("final_references"), field="handoff.final_references"
+    )
+    model_reference = _require_mapping(
+        references.get("model_artifact"),
+        field="handoff.final_references.model_artifact",
+    )
+    for reference_field, bundle_field in (
+        ("path", "model_artifact_path"),
+        ("byte_sha256", "model_artifact_sha256"),
+        ("semantic_sha256", "model_state_fingerprint"),
+    ):
+        if model_reference.get(reference_field) != bundle.get(bundle_field):
+            raise InferenceContractError(
+                f"Multiclass model reference differs at {reference_field}."
+            )
+
+    if manifest is None:
+        return
+    manifest_pairs = (
+        ("dataset_slug", "dataset_slug"),
+        ("problem_type", "problem_type"),
+        ("selected_model_id", "model_id"),
+        ("selected_model_family", "model_family"),
+        ("model_state_fingerprint", "model_state_fingerprint"),
+        ("feature_columns", "feature_columns"),
+        ("target_column", "target_column"),
+        ("target_classes", "target_classes"),
+        ("selected_hyperparameters", "selected_hyperparameters"),
+        ("preprocessing_contract", "preprocessing_contract"),
+        ("imbalance_policy", "imbalance_policy"),
+        ("decision_rule", "decision_rule"),
+        ("estimator_class_order", "estimator_class_order"),
+        ("output_class_order", "output_class_order"),
+        ("model_artifact_path", "model_artifact_path"),
+        ("model_artifact_byte_sha256", "model_artifact_sha256"),
+        ("runtime_versions", "runtime_version_requirements"),
+    )
+    for manifest_field, bundle_field in manifest_pairs:
+        if manifest.get(manifest_field) != bundle.get(bundle_field):
+            raise InferenceContractError(
+                "Multiclass manifest/bundle mismatch: "
+                f"{manifest_field}={manifest.get(manifest_field)!r}, "
+                f"{bundle_field}={bundle.get(bundle_field)!r}"
+            )
+    if manifest.get("model_state_descriptor") != bundle.get(
+        "model_state_descriptor"
+    ):
+        raise InferenceContractError("Manifest fitted-state descriptor differs from bundle.")
+
+
+def validate_bundle_handoff_alignment(
+    handoff: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any] | None = None,
+) -> None:
+    """Dispatch bundle/handoff/manifest alignment by schema generation."""
+
+    generation = _validate_matching_schema_generations(handoff, bundle)
+    if generation == "v1":
+        _validate_bundle_handoff_alignment_v1(
+            handoff, bundle, manifest=manifest
+        )
+        return
+    validate_multiclass_bundle_handoff_alignment(
+        handoff, bundle, manifest=manifest
+    )
 
 
 def _portable_relative_path(value: Any, *, field: str) -> PurePosixPath:
@@ -466,6 +709,11 @@ def _manifest_from_handoff(
         raise InferenceContractError(
             "Final model manifest SHA-256 mismatch: "
             f"expected={expected}, observed={observed}"
+        )
+    if _final_handoff_schema(handoff) == "final-model-handoff.v2":
+        return load_and_validate_final_model_manifest(
+            project_root=project_root,
+            manifest_path=relative.as_posix(),
         )
     return _load_json_object(path, label="final model manifest")
 
@@ -639,13 +887,15 @@ def report_unknown_input_categories(
 ) -> tuple[tuple[str, tuple[Any, ...]], ...]:
     """Report unknown categorical values without changing input or fitted vocabulary."""
 
+    categorical = bundle.get("categorical_features")
+    if not isinstance(categorical, Sequence) or isinstance(categorical, (str, bytes)):
+        raise InferenceContractError("bundle.categorical_features must be a list.")
+    if len(categorical) == 0:
+        return ()
     vocabularies = _require_mapping(
         bundle.get("fitted_categorical_vocabularies"),
         field="bundle.fitted_categorical_vocabularies",
     )
-    categorical = bundle.get("categorical_features")
-    if not isinstance(categorical, Sequence) or isinstance(categorical, (str, bytes)):
-        raise InferenceContractError("bundle.categorical_features must be a list.")
     report: list[tuple[str, tuple[Any, ...]]] = []
     for column in sorted(str(value) for value in categorical):
         if column not in dataframe.columns:
@@ -663,6 +913,47 @@ def report_unknown_input_categories(
     return tuple(report)
 
 
+def _validate_multiclass_input_contract(bundle: Mapping[str, Any]) -> None:
+    features = list(bundle.get("feature_columns", ()))
+    required = list(bundle.get("required_input_columns", ()))
+    numerical = list(bundle.get("numerical_features", ()))
+    categorical = list(bundle.get("categorical_features", ()))
+    if not features or required != features or numerical != features or categorical:
+        raise InferenceContractError(
+            "V2 input contract must declare one ordered, required, numerical feature set."
+        )
+    dtypes = _expected_dtype_mapping(bundle)
+    if list(dtypes) != features and set(dtypes) != set(features):
+        raise InferenceContractError("V2 expected dtype fields differ from feature columns.")
+    if any(dtypes.get(column) not in {"numeric", "integer"} for column in features):
+        raise InferenceContractError("V2 numerical inputs require numeric/integer dtypes.")
+    schema = bundle.get("expected_input_schema")
+    if not isinstance(schema, Sequence) or isinstance(schema, (str, bytes)):
+        raise InferenceContractError("bundle.expected_input_schema must be a list.")
+    if len(schema) != len(features):
+        raise InferenceContractError("V2 input schema length differs from feature count.")
+    for column, raw in zip(features, schema, strict=True):
+        entry = _require_mapping(raw, field=f"expected_input_schema[{column}]")
+        expected = {
+            "name": column,
+            "role": "numerical",
+            "required": True,
+            "expected_dtype": dtypes[column],
+            "missing_value_behavior": "reject",
+        }
+        if any(entry.get(key) != value for key, value in expected.items()):
+            raise InferenceContractError(
+                f"V2 input schema entry differs for {column}."
+            )
+    policy = _require_mapping(
+        bundle.get("missing_value_policy"), field="bundle.missing_value_policy"
+    )
+    if policy.get("strategy") != "reject_missing_required_values":
+        raise InferenceContractError("V2 missing-value strategy must reject missing values.")
+    if policy.get("learned_imputation_in_final_pipeline") is not False:
+        raise InferenceContractError("V2 final pipeline must not declare learned imputation.")
+
+
 def normalize_inference_input(
     value: Mapping[str, Any] | pd.Series | pd.DataFrame,
     *,
@@ -671,6 +962,8 @@ def normalize_inference_input(
 ) -> InputNormalizationResult:
     """Validate, defensively copy, materialize declared blanks, and coerce inputs."""
 
+    if _inference_bundle_schema(bundle) == "inference-bundle.v2":
+        _validate_multiclass_input_contract(bundle)
     frame = _as_input_dataframe(value)
     if frame.empty:
         raise InferenceInputError("Inference input must contain at least one row.")
@@ -740,7 +1033,7 @@ def _fitted_encoder(preprocess: ColumnTransformer) -> OneHotEncoder:
     return encoder
 
 
-def validate_loaded_pipeline_contract(
+def _validate_loaded_pipeline_contract_v1(
     pipeline: Any,
     *,
     bundle: Mapping[str, Any],
@@ -870,6 +1163,145 @@ def validate_loaded_pipeline_contract(
             raise InferenceContractError("Manifest model-state fingerprint differs.")
 
 
+def validate_multiclass_loaded_pipeline_contract(
+    pipeline: Any,
+    *,
+    bundle: Mapping[str, Any],
+    manifest: Mapping[str, Any] | None = None,
+) -> None:
+    """Validate a fitted numerical-only v2 pipeline without fitting or transforming."""
+
+    if _inference_bundle_schema(bundle) != "inference-bundle.v2":
+        raise InferenceContractError("Multiclass pipeline validation requires a v2 bundle.")
+    if not isinstance(pipeline, Pipeline):
+        raise InferenceContractError("Loaded artifact must be an sklearn Pipeline.")
+    if list(pipeline.named_steps) != ["preprocess", "model"]:
+        raise InferenceContractError("Pipeline steps must be exactly preprocess then model.")
+    preprocess = pipeline.named_steps["preprocess"]
+    model = pipeline.named_steps["model"]
+    if not isinstance(preprocess, ColumnTransformer):
+        raise InferenceContractError("Pipeline preprocess step must be ColumnTransformer.")
+    expected_model_family = bundle.get("model_family")
+    if model.__class__.__name__ != expected_model_family:
+        raise InferenceContractError(
+            "Pipeline model family differs from multiclass bundle."
+        )
+    try:
+        check_is_fitted(pipeline)
+        check_is_fitted(preprocess)
+        check_is_fitted(model)
+    except Exception as exc:
+        raise InferenceContractError("Loaded pipeline must already be fitted.") from exc
+
+    feature_columns = list(bundle.get("feature_columns", ()))
+    numerical = list(bundle.get("numerical_features", ()))
+    categorical = list(bundle.get("categorical_features", ()))
+    if not feature_columns or numerical != feature_columns:
+        raise InferenceContractError(
+            "Multiclass numerical feature order must equal the full feature order."
+        )
+    if categorical:
+        raise InferenceContractError(
+            "This v2 numerical-only contract must have zero categorical features."
+        )
+    if preprocess.remainder != "drop" or float(preprocess.sparse_threshold) != 0.0:
+        raise InferenceContractError(
+            "ColumnTransformer must use remainder='drop' and dense output."
+        )
+    configured = {
+        name: (transformer, list(columns))
+        for name, transformer, columns in preprocess.transformers
+    }
+    if set(configured) != {"numerical"}:
+        raise InferenceContractError(
+            "Multiclass pipeline must contain only the numerical transformer."
+        )
+    numerical_transformer, numerical_columns = configured["numerical"]
+    if numerical_transformer != "passthrough" or numerical_columns != numerical:
+        raise InferenceContractError("Numerical passthrough contract differs from bundle.")
+    observed_features = list(getattr(pipeline, "feature_names_in_", ()))
+    if observed_features != feature_columns:
+        raise InferenceContractError("Loaded pipeline feature order differs from bundle.")
+
+    descriptor = _require_mapping(
+        bundle.get("model_state_descriptor"), field="bundle.model_state_descriptor"
+    )
+    transformed = list(preprocess.get_feature_names_out())
+    expected_transformed = list(descriptor.get("transformed_feature_names", ()))
+    if transformed != expected_transformed:
+        raise InferenceContractError("Transformed feature names differ from bundle.")
+    if descriptor.get("steps") != ["preprocess", "model"]:
+        raise InferenceContractError("Fitted-state step descriptor differs.")
+    if descriptor.get("feature_order") != feature_columns:
+        raise InferenceContractError("Fitted-state feature order differs.")
+    if descriptor.get("preprocessing_contract") != bundle.get(
+        "preprocessing_contract"
+    ):
+        raise InferenceContractError("Fitted-state preprocessing contract differs.")
+
+    classes = [_python_scalar(value) for value in np.asarray(model.classes_).tolist()]
+    estimator_order = list(bundle.get("estimator_class_order", ()))
+    output_order = list(bundle.get("output_class_order", ()))
+    if classes != estimator_order:
+        raise InferenceContractError(
+            f"Estimator class order differs: expected={estimator_order}, observed={classes}"
+        )
+    if len(output_order) < 3 or set(classes) != set(output_order):
+        raise InferenceContractError("Estimator class set differs from output class set.")
+    if descriptor.get("estimator_class_order") != classes:
+        raise InferenceContractError("Fitted-state estimator class order differs.")
+    if descriptor.get("output_class_order") != output_order:
+        raise InferenceContractError("Fitted-state output class order differs.")
+
+    params = model.get_params(deep=False)
+    hyperparameters = _require_mapping(
+        bundle.get("selected_hyperparameters"),
+        field="bundle.selected_hyperparameters",
+    )
+    for key, expected in hyperparameters.items():
+        parameter = str(key).removeprefix("model__")
+        if parameter not in params or params[parameter] != expected:
+            raise InferenceContractError(
+                f"Loaded model hyperparameter differs for {parameter}."
+            )
+    if "random_state" in params and params["random_state"] != bundle.get(
+        "estimator_random_state"
+    ):
+        raise InferenceContractError("Loaded model random_state differs from bundle.")
+    if descriptor.get("random_state") != bundle.get("estimator_random_state"):
+        raise InferenceContractError("Fitted-state random_state differs from bundle.")
+    fingerprint = bundle.get("model_state_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise InferenceContractError("Model-state fingerprint is missing from bundle.")
+
+    if manifest is not None:
+        if manifest.get("model_state_descriptor") != dict(descriptor):
+            raise InferenceContractError(
+                "Manifest fitted-state descriptor differs from loaded bundle."
+            )
+        if manifest.get("model_state_fingerprint") != fingerprint:
+            raise InferenceContractError("Manifest model-state fingerprint differs.")
+
+
+def validate_loaded_pipeline_contract(
+    pipeline: Any,
+    *,
+    bundle: Mapping[str, Any],
+    manifest: Mapping[str, Any] | None = None,
+) -> None:
+    """Dispatch fitted-pipeline validation by inference-bundle schema."""
+
+    schema = _inference_bundle_schema(bundle)
+    if schema == "inference-bundle.v1":
+        _validate_loaded_pipeline_contract_v1(
+            pipeline, bundle=bundle, manifest=manifest
+        )
+        return
+    validate_multiclass_loaded_pipeline_contract(
+        pipeline, bundle=bundle, manifest=manifest
+    )
+
+
 def resolve_positive_probability_column(
     pipeline: Pipeline, *, bundle: Mapping[str, Any]
 ) -> int:
@@ -888,6 +1320,214 @@ def resolve_positive_probability_column(
             "Positive encoded label cannot be resolved uniquely from estimator classes_."
         )
     return matches[0]
+
+
+def resolve_multiclass_probability_columns(
+    pipeline: Pipeline, *, bundle: Mapping[str, Any]
+) -> tuple[int, ...]:
+    """Resolve estimator probability columns into the declared v2 output order."""
+
+    if _inference_bundle_schema(bundle) != "inference-bundle.v2":
+        raise InferenceContractError("Multiclass probability mapping requires v2.")
+    if not isinstance(pipeline, Pipeline) or "model" not in pipeline.named_steps:
+        raise InferenceContractError("A fitted sklearn Pipeline is required.")
+    classes = [
+        _python_scalar(value)
+        for value in np.asarray(pipeline.named_steps["model"].classes_).tolist()
+    ]
+    estimator_order = list(bundle.get("estimator_class_order", ()))
+    output_order = list(bundle.get("output_class_order", ()))
+    if classes != estimator_order:
+        raise InferenceContractError(
+            "Loaded estimator class order differs from the bundle declaration."
+        )
+    if len(output_order) < 3 or set(classes) != set(output_order):
+        raise InferenceContractError(
+            "Estimator classes differ from the multiclass output contract."
+        )
+    return tuple(classes.index(label) for label in output_order)
+
+
+def build_multiclass_inference_output(
+    raw_probabilities: Any,
+    *,
+    estimator_predictions: Sequence[Any],
+    index: pd.Index,
+    pipeline: Pipeline,
+    bundle: Mapping[str, Any],
+    normalization: InputNormalizationResult,
+    runtime_report: RuntimeCompatibilityReport | None = None,
+) -> pd.DataFrame:
+    """Validate, remap, and build the educational v2 core output contract."""
+
+    if _inference_bundle_schema(bundle) != "inference-bundle.v2":
+        raise InferenceContractError("Multiclass output construction requires v2.")
+    if bundle.get("decision_rule") != "argmax_class_score_or_probability":
+        raise InferenceContractError("Unsupported multiclass decision rule.")
+    output_contract = _require_mapping(
+        bundle.get("inference_output_contract"),
+        field="bundle.inference_output_contract",
+    )
+    output_order = list(bundle.get("output_class_order", ()))
+    probability_contract = _require_mapping(
+        output_contract.get("class_probabilities"),
+        field="bundle.inference_output_contract.class_probabilities",
+    )
+    if output_contract.get("class_order") != output_order:
+        raise InferenceContractError("Output class order differs from output contract.")
+    if probability_contract.get("length") != len(output_order):
+        raise InferenceContractError("Probability length differs from output class count.")
+    if probability_contract.get("aligned_to") != "class_order":
+        raise InferenceContractError("Probabilities must be aligned to class_order.")
+
+    raw = np.asarray(raw_probabilities, dtype=float)
+    if raw.ndim != 2 or raw.shape[0] != len(index):
+        raise InferenceContractError("predict_proba returned an unexpected shape.")
+    columns = resolve_multiclass_probability_columns(pipeline, bundle=bundle)
+    if raw.shape[1] != len(columns):
+        raise InferenceContractError("predict_proba class count differs from bundle.")
+    ordered = raw[:, list(columns)].copy()
+    if ordered.shape != (len(index), len(output_order)):
+        raise InferenceContractError("Remapped probability shape differs from contract.")
+    tolerance = 1e-12
+    if not np.isfinite(ordered).all():
+        raise InferenceContractError("Multiclass probabilities must be finite.")
+    if (ordered < -tolerance).any() or (ordered > 1.0 + tolerance).any():
+        raise InferenceContractError("Multiclass probabilities must be in [0, 1].")
+    if not np.allclose(ordered.sum(axis=1), 1.0, rtol=0.0, atol=1e-8):
+        raise InferenceContractError("Multiclass probability rows must sum to one.")
+
+    argmax_positions = np.argmax(ordered, axis=1)
+    predicted = [output_order[int(position)] for position in argmax_positions]
+    estimator_labels = [_python_scalar(value) for value in estimator_predictions]
+    if len(estimator_labels) != len(index):
+        raise InferenceContractError("Estimator prediction count differs from input rows.")
+    if estimator_labels != predicted:
+        raise InferenceContractError(
+            "Estimator predictions disagree with remapped probability argmax."
+        )
+    fingerprint = bundle.get("model_state_fingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint:
+        raise InferenceContractError("Model-state fingerprint is missing from bundle.")
+
+    records: list[dict[str, Any]] = []
+    for position, label in enumerate(predicted):
+        probabilities = [float(value) for value in ordered[position].tolist()]
+        records.append(
+            {
+                "predicted_class": _python_scalar(label),
+                "class_order": deepcopy(output_order),
+                "class_probabilities": probabilities,
+                "top_probability": float(max(probabilities)),
+                "operational_prediction_available": False,
+                "unknown_categories_report": normalization.unknown_categories_dict(),
+                "input_materializations_applied": normalization.materializations_dict(),
+                "runtime_compatibility_confirmed": bool(
+                    runtime_report.compatible if runtime_report is not None else False
+                ),
+                "runtime_compatibility_report": (
+                    runtime_report.as_dict() if runtime_report is not None else None
+                ),
+                "model_state_fingerprint": fingerprint,
+            }
+        )
+    output = pd.DataFrame(records, index=index.copy())
+    if len(output) != len(index):
+        raise InferenceContractError("Output row count differs from input row count.")
+    for column in output.columns:
+        output[column] = output[column].astype(object)
+    return output
+
+
+def predict_multiclass_batch(
+    pipeline: Pipeline,
+    value: Mapping[str, Any] | pd.Series | pd.DataFrame,
+    *,
+    bundle: Mapping[str, Any],
+    runtime_report: RuntimeCompatibilityReport | None = None,
+    validate_pipeline: bool = True,
+) -> pd.DataFrame:
+    """Normalize inputs and run one safe, contract-aligned v2 batch inference."""
+
+    if _inference_bundle_schema(bundle) != "inference-bundle.v2":
+        raise InferenceContractError("predict_multiclass_batch requires a v2 bundle.")
+    if validate_pipeline:
+        validate_multiclass_loaded_pipeline_contract(pipeline, bundle=bundle)
+    normalization = normalize_inference_input(value, bundle=bundle)
+    inference_frame = normalization.dataframe.copy(deep=True)
+    probabilities = pipeline.predict_proba(inference_frame.copy(deep=True))
+    predictions = pipeline.predict(inference_frame.copy(deep=True))
+    return build_multiclass_inference_output(
+        probabilities,
+        estimator_predictions=predictions,
+        index=inference_frame.index,
+        pipeline=pipeline,
+        bundle=bundle,
+        normalization=normalization,
+        runtime_report=runtime_report,
+    )
+
+
+def predict_multiclass(
+    pipeline: Pipeline,
+    value: Mapping[str, Any] | pd.Series | pd.DataFrame,
+    *,
+    bundle: Mapping[str, Any],
+    runtime_report: RuntimeCompatibilityReport | None = None,
+    validate_pipeline: bool = True,
+) -> dict[str, Any]:
+    """Run one v2 inference and return an unambiguous Python-native result."""
+
+    output = predict_multiclass_batch(
+        pipeline,
+        value,
+        bundle=bundle,
+        runtime_report=runtime_report,
+        validate_pipeline=validate_pipeline,
+    )
+    if len(output) != 1:
+        raise InferenceInputError("Single-row inference requires exactly one input row.")
+    row = output.iloc[0]
+    return {
+        "predicted_class": _python_scalar(row["predicted_class"]),
+        "class_order": deepcopy(row["class_order"]),
+        "class_probabilities": deepcopy(row["class_probabilities"]),
+        "top_probability": float(row["top_probability"]),
+        "operational_prediction_available": False,
+        "unknown_categories_report": deepcopy(row["unknown_categories_report"]),
+        "input_materializations_applied": deepcopy(
+            row["input_materializations_applied"]
+        ),
+        "runtime_compatibility_confirmed": bool(
+            row["runtime_compatibility_confirmed"]
+        ),
+        "runtime_compatibility_report": deepcopy(row["runtime_compatibility_report"]),
+        "model_state_fingerprint": str(row["model_state_fingerprint"]),
+    }
+
+
+def multiclass_output_to_frame(output: pd.DataFrame) -> pd.DataFrame:
+    """Create a presentation table without changing the v2 core output contract."""
+
+    required = {"predicted_class", "class_order", "class_probabilities"}
+    if not required.issubset(output.columns) or output.empty:
+        raise InferenceContractError("A non-empty multiclass core output is required.")
+    class_order = list(output.iloc[0]["class_order"])
+    records: list[dict[str, Any]] = []
+    for _, row in output.iterrows():
+        row_order = list(row["class_order"])
+        probabilities = list(row["class_probabilities"])
+        if row_order != class_order or len(probabilities) != len(class_order):
+            raise InferenceContractError("Multiclass output rows use inconsistent classes.")
+        record = {"predicted_class": row["predicted_class"]}
+        record.update(
+            {
+                f"probability_{label}": float(probability)
+                for label, probability in zip(class_order, probabilities, strict=True)
+            }
+        )
+        records.append(record)
+    return pd.DataFrame(records, index=output.index.copy())
 
 
 def build_inference_output(
@@ -1029,15 +1669,23 @@ __all__ = [
     "current_runtime_versions",
     "validate_runtime_compatibility",
     "validate_inference_readiness",
+    "validate_multiclass_inference_readiness",
     "validate_bundle_handoff_alignment",
+    "validate_multiclass_bundle_handoff_alignment",
     "validate_model_artifact_before_load",
     "load_validated_inference_pipeline",
     "validate_loaded_pipeline_contract",
+    "validate_multiclass_loaded_pipeline_contract",
     "normalize_inference_input",
     "apply_declared_missing_value_policy",
     "report_unknown_input_categories",
     "resolve_positive_probability_column",
+    "resolve_multiclass_probability_columns",
     "predict_educational",
     "predict_educational_batch",
     "build_inference_output",
+    "predict_multiclass",
+    "predict_multiclass_batch",
+    "build_multiclass_inference_output",
+    "multiclass_output_to_frame",
 ]
