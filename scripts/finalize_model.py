@@ -23,11 +23,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 import joblib
+import numpy as np
 import pandas as pd
 import sklearn
 from sklearn.base import BaseEstimator, clone
 from sklearn.calibration import calibration_curve
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -49,6 +51,7 @@ from sklearn.utils.validation import check_is_fitted
 from scripts.prepare_data import load_and_validate_preparation_handoff
 from scripts.select_models import (
     build_candidate_pipeline,
+    compute_multiclass_metrics,
     load_and_validate_model_selection_handoff,
 )
 
@@ -1786,3 +1789,1932 @@ def load_trusted_pipeline_from_bundle(
 
 # Explicit aliases retained for a readable notebook API.
 validate_finalization_contract = validate_finalization_contract
+
+
+# ---------------------------------------------------------------------------
+# Multiclass finalization (v2)
+# ---------------------------------------------------------------------------
+
+
+MULTICLASS_FINAL_SCHEMAS: Mapping[str, tuple[str, str]] = {
+    "final-model-manifest.json": (
+        "final-model-manifest.v2",
+        "final_model_manifest",
+    ),
+    "final-test-evidence.json": (
+        "final-test-evidence.v2",
+        "final_test_evidence",
+    ),
+    "inference-bundle.json": ("inference-bundle.v2", "inference_bundle"),
+    "final-model-handoff.json": (
+        "final-model-handoff.v2",
+        "final_model_handoff",
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MulticlassFrozenFinalizationContract:
+    """Immutable seven-or-more-class decisions frozen before final fit."""
+
+    dataset_slug: str
+    problem_type: str
+    model_selection_handoff_path: str
+    model_selection_handoff_sha256: str
+    model_id: str
+    model_family: str
+    hyperparameters: tuple[tuple[str, Any], ...]
+    random_state: int | None
+    feature_policy: str
+    feature_columns: tuple[str, ...]
+    numerical_features: tuple[str, ...]
+    categorical_features: tuple[str, ...]
+    identifier_columns: tuple[str, ...]
+    target_column: str
+    target_classes: tuple[Any, ...]
+    target_encoding: tuple[tuple[Any, int], ...]
+    target_semantics: str
+    preprocessing_contract: tuple[tuple[str, Any], ...]
+    imbalance_policy: tuple[tuple[str, Any], ...]
+    decision_rule: str
+    training_partitions: tuple[str, ...]
+    evaluation_partition: str
+    test_partition_path: str
+    test_partition_sha256: str
+    test_partition_row_count: int
+    access_test_only_after_contract_freeze_and_final_fit: bool = True
+    evaluate_test_once: bool = True
+
+    def as_dict(self) -> dict[str, Any]:
+        return _jsonable(
+            {
+                "dataset_slug": self.dataset_slug,
+                "problem_type": self.problem_type,
+                "model_selection_handoff_reference": {
+                    "path": self.model_selection_handoff_path,
+                    "byte_sha256": self.model_selection_handoff_sha256,
+                },
+                "model_id": self.model_id,
+                "model_family": self.model_family,
+                "hyperparameters": dict(self.hyperparameters),
+                "random_state": self.random_state,
+                "feature_policy": self.feature_policy,
+                "feature_columns": list(self.feature_columns),
+                "numerical_features": list(self.numerical_features),
+                "categorical_features": list(self.categorical_features),
+                "identifier_columns": list(self.identifier_columns),
+                "target_column": self.target_column,
+                "target_classes": list(self.target_classes),
+                "target_encoding": dict(self.target_encoding),
+                "target_semantics": self.target_semantics,
+                "positive_class": "not_applicable",
+                "binary_threshold": "not_applicable",
+                "operational_threshold": "not_applicable",
+                "preprocessing_contract": dict(self.preprocessing_contract),
+                "imbalance_policy": dict(self.imbalance_policy),
+                "decision_rule": self.decision_rule,
+                "training_partitions": list(self.training_partitions),
+                "evaluation_partition": self.evaluation_partition,
+                "test_access_policy": {
+                    "access_only_after_contract_freeze_and_final_fit": self.access_test_only_after_contract_freeze_and_final_fit,
+                    "evaluate_once": self.evaluate_test_once,
+                },
+                "test_partition_reference": {
+                    "path": self.test_partition_path,
+                    "byte_sha256": self.test_partition_sha256,
+                    "row_count": self.test_partition_row_count,
+                },
+            }
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        return semantic_fingerprint(self.as_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class MulticlassFinalTrainingData:
+    """Defensive train+validation data with readable nominal targets."""
+
+    _features: pd.DataFrame
+    _target: pd.Series
+    class_counts: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_features", self._features.copy(deep=True))
+        object.__setattr__(self, "_target", self._target.copy(deep=True))
+
+    @property
+    def features(self) -> pd.DataFrame:
+        return self._features.copy(deep=True)
+
+    @property
+    def target(self) -> pd.Series:
+        return self._target.copy(deep=True)
+
+    @property
+    def row_count(self) -> int:
+        return int(len(self._features))
+
+
+@dataclass(frozen=True, slots=True)
+class MulticlassTestPartitionData:
+    """Test data created only after the frozen/fitted access gate."""
+
+    _features: pd.DataFrame
+    _target: pd.Series
+    row_count: int
+    class_counts: tuple[tuple[str, int], ...]
+    partition_path: str
+    partition_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_features", self._features.copy(deep=True))
+        object.__setattr__(self, "_target", self._target.copy(deep=True))
+
+    @property
+    def features(self) -> pd.DataFrame:
+        return self._features.copy(deep=True)
+
+    @property
+    def target(self) -> pd.Series:
+        return self._target.copy(deep=True)
+
+
+@dataclass(frozen=True, slots=True)
+class MulticlassFinalEvaluation:
+    """Aggregate-only official test evidence from one probability call."""
+
+    metrics: Mapping[str, Any]
+    per_class: Sequence[Mapping[str, Any]]
+    confusion_matrix: Mapping[str, Any]
+    estimator_class_order: tuple[Any, ...]
+    output_class_order: tuple[Any, ...]
+    validation_to_test: Mapping[str, Any]
+    confusion_pair_comparison: Mapping[str, Any]
+    repeated_profile_sensitivity: Mapping[str, Any]
+    probability_sha256: str
+    test_probability_evaluation_count: int = 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return _deepcopy(
+            {
+                "metrics": self.metrics,
+                "per_class": list(self.per_class),
+                "confusion_matrix": self.confusion_matrix,
+                "estimator_class_order": list(self.estimator_class_order),
+                "output_class_order": list(self.output_class_order),
+                "validation_to_test": self.validation_to_test,
+                "confusion_pair_comparison": self.confusion_pair_comparison,
+                "repeated_profile_sensitivity": self.repeated_profile_sensitivity,
+                "probability_sha256_aggregate_only": self.probability_sha256,
+                "test_probability_evaluation_count": self.test_probability_evaluation_count,
+            }
+        )
+
+
+def validate_multiclass_finalization_contract(
+    model_selection_handoff: Mapping[str, Any],
+) -> None:
+    """Validate Notebook-03 v2 readiness without introducing binary semantics."""
+
+    if model_selection_handoff.get("schema_version") != "model-selection-handoff.v2":
+        raise FinalizationContractError("Invalid multiclass model-selection handoff schema.")
+    if model_selection_handoff.get("artifact_type") != "model_selection_handoff":
+        raise FinalizationContractError("Invalid multiclass model-selection artifact type.")
+    if model_selection_handoff.get("problem_type") != "multiclass_classification":
+        raise FinalizationContractError("Finalization input is not multiclass classification.")
+    classes = model_selection_handoff.get("target_classes")
+    if not isinstance(classes, list) or len(classes) < 3 or len(set(classes)) != len(classes):
+        raise FinalizationContractError("Multiclass target classes are invalid.")
+    if model_selection_handoff.get("target_semantics") != "nominal_unordered":
+        raise FinalizationContractError("Multiclass target semantics must be nominal_unordered.")
+    if model_selection_handoff.get("positive_class") is not None:
+        raise FinalizationContractError("Multiclass finalization cannot define a positive class.")
+    for field in ("binary_threshold", "operational_threshold"):
+        value = model_selection_handoff.get(field)
+        if not isinstance(value, Mapping) or value.get("status") != "not_applicable" or value.get("value") is not None:
+            raise FinalizationContractError(f"{field} must be explicitly not_applicable.")
+    if model_selection_handoff.get("decision_rule") != "argmax_class_score_or_probability":
+        raise FinalizationContractError("Multiclass decision rule is invalid.")
+    if model_selection_handoff.get("test_partition_sealed") is not True:
+        raise FinalizationContractError("Test must be sealed at finalization input.")
+    if model_selection_handoff.get("test_partition_evaluated") is not False:
+        raise FinalizationContractError("Test must be unevaluated at finalization input.")
+    readiness = model_selection_handoff.get("readiness", {})
+    required_true = {
+        "preparation_handoff_validated",
+        "selected_candidate_frozen",
+        "imbalance_policy_frozen",
+        "multiclass_decision_rule_frozen",
+        "final_model_training_ready",
+        "test_partition_sealed",
+    }
+    if any(readiness.get(key) is not True for key in required_true):
+        raise FinalizationContractError("Multiclass final-training readiness is incomplete.")
+    if model_selection_handoff.get("final_model_trained") is not False:
+        raise FinalizationContractError("Final model must not be trained upstream.")
+    if model_selection_handoff.get("model_artifact") is not None:
+        raise FinalizationContractError("Upstream model artifact must be absent.")
+    if model_selection_handoff.get("model_artifact_materialized") is not False:
+        raise FinalizationContractError("Upstream model artifact must be unmaterialized.")
+    if model_selection_handoff.get("model_bundle_materialized") is not False:
+        raise FinalizationContractError("Upstream model bundle must be unmaterialized.")
+    if model_selection_handoff.get("operational_modeling_ready") is not False:
+        raise FinalizationContractError("Operational readiness must remain false.")
+    if model_selection_handoff.get("operational_validity") != "unconfirmed":
+        raise FinalizationContractError("Operational validity must remain unconfirmed.")
+    preprocessing = model_selection_handoff.get("selected_preprocessing_contract", {})
+    expected_preprocessing = {
+        "pipeline": "sklearn.pipeline.Pipeline",
+        "numerical_scaling": "none",
+        "categorical_processing": "not_applicable",
+        "feature_projection": model_selection_handoff.get("selected_feature_columns"),
+        "learned_preprocessing_in_notebook_02": False,
+        "scaling_fit_scope": "inside_training_fold_or_final_training_only",
+    }
+    if preprocessing != expected_preprocessing:
+        raise FinalizationContractError("Selected multiclass preprocessing contract changed.")
+    if model_selection_handoff.get("selected_imbalance_policy") != {
+        "strategy": "none",
+        "class_weight": None,
+        "resampling": "none",
+    }:
+        raise FinalizationContractError("Selected multiclass imbalance policy changed.")
+    instructions = model_selection_handoff.get("final_training_instructions", {})
+    required_instructions = {
+        "reconstruct_pipeline_from_contract": True,
+        "fit_partitions": ["train", "validation"],
+        "final_evaluation_partition": "test",
+        "access_test_only_after_contract_freeze_and_final_fit": True,
+        "evaluate_test_once": True,
+        "do_not_retune": True,
+        "do_not_change_feature_policy": True,
+        "do_not_change_imbalance_policy": True,
+        "do_not_change_hyperparameters": True,
+        "decision_rule": "argmax_class_score_or_probability",
+    }
+    if any(instructions.get(key) != value for key, value in required_instructions.items()):
+        raise FinalizationContractError("Frozen final-training instructions changed.")
+    _validate_paths_recursively(model_selection_handoff)
+
+
+def freeze_multiclass_finalization_decisions(
+    *,
+    dataset_slug: str,
+    model_selection_handoff: Mapping[str, Any],
+    feature_manifest: Mapping[str, Any],
+    split_manifest: Mapping[str, Any],
+    model_selection_handoff_path: str | Path,
+    model_selection_handoff_sha256: str,
+) -> MulticlassFrozenFinalizationContract:
+    """Freeze every model/data decision before the final fit and test access."""
+
+    validate_multiclass_finalization_contract(model_selection_handoff)
+    if model_selection_handoff.get("dataset_slug") != dataset_slug:
+        raise FinalizationContractError("Dataset slug differs from model-selection handoff.")
+    features = list(model_selection_handoff["selected_feature_columns"])
+    if features != list(feature_manifest.get("feature_columns", ())):
+        raise FinalizationContractError("Selected feature order differs from preparation.")
+    if model_selection_handoff["target_classes"] != feature_manifest.get("target_classes"):
+        raise FinalizationContractError("Target class order differs from preparation.")
+    if model_selection_handoff["target_encoding"] != feature_manifest.get("target_encoding_contract"):
+        raise FinalizationContractError("Target encoding differs from preparation.")
+    test_path = split_manifest.get("partition_paths", {}).get("test")
+    test_sha = split_manifest.get("partition_sha256", {}).get("test")
+    test_rows = split_manifest.get("row_counts", {}).get("test")
+    if not isinstance(test_path, str) or not isinstance(test_sha, str) or not isinstance(test_rows, int):
+        raise FinalizationContractError("Frozen test integrity reference is incomplete.")
+    instructions = model_selection_handoff["final_training_instructions"]
+    contract = MulticlassFrozenFinalizationContract(
+        dataset_slug=dataset_slug,
+        problem_type="multiclass_classification",
+        model_selection_handoff_path=_require_relative_path(
+            model_selection_handoff_path, field="model_selection_handoff_path"
+        ),
+        model_selection_handoff_sha256=str(model_selection_handoff_sha256),
+        model_id=str(model_selection_handoff["selected_model_id"]),
+        model_family=str(model_selection_handoff["selected_model_family"]),
+        hyperparameters=tuple(sorted(_deepcopy(model_selection_handoff["selected_hyperparameters"]).items())),
+        random_state=int(model_selection_handoff["random_seeds"]["estimators"]),
+        feature_policy=str(model_selection_handoff["selected_feature_policy"]),
+        feature_columns=tuple(features),
+        numerical_features=tuple(feature_manifest["numerical_features"]),
+        categorical_features=tuple(feature_manifest["categorical_features"]),
+        identifier_columns=tuple(feature_manifest["identifier_columns"]),
+        target_column=str(feature_manifest["target_column"]),
+        target_classes=tuple(feature_manifest["target_classes"]),
+        target_encoding=tuple(
+            (label, int(feature_manifest["target_encoding_contract"][label]))
+            for label in feature_manifest["target_classes"]
+        ),
+        target_semantics=str(model_selection_handoff["target_semantics"]),
+        preprocessing_contract=tuple(
+            sorted(_deepcopy(model_selection_handoff["selected_preprocessing_contract"]).items())
+        ),
+        imbalance_policy=tuple(
+            sorted(_deepcopy(model_selection_handoff["selected_imbalance_policy"]).items())
+        ),
+        decision_rule=str(model_selection_handoff["decision_rule"]),
+        training_partitions=tuple(instructions["fit_partitions"]),
+        evaluation_partition=str(instructions["final_evaluation_partition"]),
+        test_partition_path=test_path,
+        test_partition_sha256=test_sha,
+        test_partition_row_count=int(test_rows),
+    )
+    validate_multiclass_frozen_model_contract(contract)
+    return contract
+
+
+def validate_multiclass_frozen_model_contract(
+    contract: MulticlassFrozenFinalizationContract,
+) -> None:
+    if contract.problem_type != "multiclass_classification":
+        raise FinalizationContractError("Frozen problem type is not multiclass.")
+    if contract.model_family != "HistGradientBoostingClassifier":
+        raise FinalizationContractError("Unsupported frozen multiclass model family.")
+    features = list(contract.feature_columns)
+    if not features or len(features) != len(set(features)):
+        raise FinalizationContractError("Frozen feature columns must be unique and non-empty.")
+    if tuple(contract.numerical_features) != tuple(contract.feature_columns):
+        raise FinalizationContractError("Dry Bean features must remain numerical-only.")
+    if contract.categorical_features:
+        raise FinalizationContractError("Dry Bean cannot acquire categorical features.")
+    if (set(contract.identifier_columns) | {contract.target_column}) & set(features):
+        raise FinalizationContractError("Target/identifiers cannot enter final features.")
+    if len(contract.target_classes) < 3 or len(set(contract.target_classes)) != len(contract.target_classes):
+        raise FinalizationContractError("Frozen multiclass target contract is invalid.")
+    encoding = dict(contract.target_encoding)
+    if list(encoding) != list(contract.target_classes):
+        raise FinalizationContractError("Target encoding order must follow target contract order.")
+    if sorted(encoding.values()) != list(range(len(contract.target_classes))):
+        raise FinalizationContractError("Target encoding must be deterministic 0..K-1 metadata.")
+    if contract.target_semantics != "nominal_unordered":
+        raise FinalizationContractError("Frozen target semantics changed.")
+    if contract.feature_policy != "all_features":
+        raise FinalizationContractError("Frozen feature policy must remain all_features.")
+    if contract.decision_rule != "argmax_class_score_or_probability":
+        raise FinalizationContractError("Frozen decision rule changed.")
+    if contract.training_partitions != ("train", "validation") or contract.evaluation_partition != "test":
+        raise FinalizationContractError("Final partition roles changed.")
+    if not contract.access_test_only_after_contract_freeze_and_final_fit or not contract.evaluate_test_once:
+        raise FinalizationContractError("Test access policy changed.")
+    if dict(contract.imbalance_policy) != {"class_weight": None, "resampling": "none", "strategy": "none"}:
+        raise FinalizationContractError("Frozen imbalance policy changed.")
+    preprocessing = dict(contract.preprocessing_contract)
+    if preprocessing.get("numerical_scaling") != "none" or preprocessing.get("categorical_processing") != "not_applicable":
+        raise FinalizationContractError("Frozen preprocessing changed.")
+    if preprocessing.get("feature_projection") != list(contract.feature_columns):
+        raise FinalizationContractError("Frozen preprocessing feature projection changed.")
+    if contract.test_partition_row_count <= 0 or len(contract.test_partition_sha256) != 64:
+        raise FinalizationContractError("Frozen test integrity reference is invalid.")
+
+
+def validate_multiclass_final_partition_roles(
+    frame: pd.DataFrame,
+    *,
+    contract: MulticlassFrozenFinalizationContract,
+    partition_name: str,
+) -> None:
+    expected = [*contract.identifier_columns, *contract.feature_columns, contract.target_column]
+    if list(frame.columns) != expected:
+        raise FinalizationContractError(
+            f"{partition_name} column order mismatch. expected={expected}, observed={list(frame.columns)}"
+        )
+    if frame[list(contract.feature_columns)].isna().any().any():
+        raise FinalizationContractError(f"{partition_name} contains missing predictor values.")
+    observed = set(frame[contract.target_column].dropna().tolist())
+    if observed != set(contract.target_classes):
+        raise FinalizationContractError(f"{partition_name} target classes differ from contract.")
+
+
+def assemble_multiclass_final_training_data(
+    *,
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    contract: MulticlassFrozenFinalizationContract,
+) -> MulticlassFinalTrainingData:
+    """Assemble train+validation in persisted order; no test argument exists."""
+
+    train_copy = train.copy(deep=True)
+    validation_copy = validation.copy(deep=True)
+    validate_multiclass_final_partition_roles(train_copy, contract=contract, partition_name="train")
+    validate_multiclass_final_partition_roles(validation_copy, contract=contract, partition_name="validation")
+    combined = pd.concat([train_copy, validation_copy], axis=0, ignore_index=True)
+    features = combined.loc[:, list(contract.feature_columns)].copy(deep=True)
+    target = combined[contract.target_column].astype("string").copy(deep=True)
+    counts = tuple(
+        (str(label), int((target == label).sum())) for label in contract.target_classes
+    )
+    if set(target.unique().tolist()) != set(contract.target_classes):
+        raise FinalizationContractError("Final training target does not contain every class.")
+    return MulticlassFinalTrainingData(features, target, counts)
+
+
+def reconstruct_multiclass_selected_pipeline(
+    *, contract: MulticlassFrozenFinalizationContract
+) -> Pipeline:
+    """Reconstruct exactly the Notebook-03 HGB pipeline and parameters."""
+
+    validate_multiclass_frozen_model_contract(contract)
+    estimator = HistGradientBoostingClassifier(random_state=contract.random_state)
+    accepted = estimator.get_params(deep=True)
+    parameters: dict[str, Any] = {}
+    for key, value in contract.hyperparameters:
+        if not key.startswith("model__"):
+            raise FinalizationContractError(f"Selected hyperparameter lacks model__ prefix: {key}")
+        name = key.removeprefix("model__")
+        if name not in accepted:
+            raise FinalizationContractError(f"Estimator does not accept selected parameter: {name}")
+        parameters[name] = value
+    parameters["random_state"] = contract.random_state
+    estimator.set_params(**parameters)
+    pipeline = build_candidate_pipeline(
+        estimator=estimator,
+        numerical_features=contract.feature_columns,
+        categorical_features=(),
+        scale_numerical=False,
+    )
+    verify_multiclass_pipeline_contract(pipeline, contract=contract, require_fitted=False)
+    return pipeline
+
+
+def verify_multiclass_pipeline_contract(
+    pipeline: Pipeline,
+    *,
+    contract: MulticlassFrozenFinalizationContract,
+    require_fitted: bool,
+) -> None:
+    if not isinstance(pipeline, Pipeline) or list(pipeline.named_steps) != ["preprocess", "model"]:
+        raise FinalizationContractError("Final multiclass artifact must be preprocess+model Pipeline.")
+    preprocess = pipeline.named_steps["preprocess"]
+    model = pipeline.named_steps["model"]
+    if not isinstance(preprocess, ColumnTransformer):
+        raise FinalizationContractError("Multiclass preprocess step must be ColumnTransformer.")
+    if model.__class__.__name__ != contract.model_family:
+        raise FinalizationContractError("Fitted estimator family differs from contract.")
+    if preprocess.remainder != "drop" or float(preprocess.sparse_threshold) != 0.0:
+        raise FinalizationContractError("Multiclass ColumnTransformer policy changed.")
+    transformers = {name: (transformer, list(columns)) for name, transformer, columns in preprocess.transformers}
+    if set(transformers) != {"numerical"}:
+        raise FinalizationContractError("Multiclass pipeline acquired an unexpected transformer.")
+    transformer, columns = transformers["numerical"]
+    if transformer != "passthrough" or columns != list(contract.feature_columns):
+        raise FinalizationContractError("Numerical passthrough feature order changed.")
+    params = model.get_params(deep=False)
+    for key, expected in contract.hyperparameters:
+        if params.get(key.removeprefix("model__")) != expected:
+            raise FinalizationContractError(f"Model parameter mismatch: {key}")
+    if params.get("random_state") != contract.random_state:
+        raise FinalizationContractError("Estimator random_state mismatch.")
+    fitted = _is_fitted(pipeline)
+    if require_fitted and not fitted:
+        raise FinalizationContractError("Multiclass pipeline must be fitted.")
+    if not require_fitted and fitted:
+        raise FinalizationContractError("Multiclass pipeline must be unfitted before final fit.")
+    if require_fitted:
+        classes = list(_jsonable(model.classes_))
+        if set(classes) != set(contract.target_classes):
+            raise FinalizationContractError("Estimator fitted classes differ from target contract.")
+
+
+def validate_multiclass_test_access_gate(
+    *,
+    contract: MulticlassFrozenFinalizationContract,
+    fitted_pipeline: Pipeline,
+    project_root: str | Path,
+) -> Path:
+    """Hash the sealed test bytes before any CSV parsing is allowed."""
+
+    validate_multiclass_frozen_model_contract(contract)
+    verify_multiclass_pipeline_contract(fitted_pipeline, contract=contract, require_fitted=True)
+    root = Path(project_root).resolve()
+    relative = _require_relative_path(contract.test_partition_path, field="test_partition_path")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise TestAccessError("Test path escapes project root.") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"Test partition is missing: {relative}")
+    observed = sha256_file(path)
+    if observed != contract.test_partition_sha256:
+        raise TestAccessError(
+            f"Test SHA-256 mismatch: expected={contract.test_partition_sha256}, observed={observed}"
+        )
+    return path
+
+
+def load_multiclass_test_partition_after_fit(
+    *,
+    project_root: str | Path,
+    fitted_pipeline: Pipeline,
+    contract: MulticlassFrozenFinalizationContract,
+) -> MulticlassTestPartitionData:
+    path = validate_multiclass_test_access_gate(
+        contract=contract, fitted_pipeline=fitted_pipeline, project_root=project_root
+    )
+    frame = pd.read_csv(path)
+    validate_multiclass_final_partition_roles(frame, contract=contract, partition_name="test")
+    if len(frame) != contract.test_partition_row_count:
+        raise TestAccessError("Test row count differs from the sealed contract.")
+    target = frame[contract.target_column].astype("string")
+    counts = tuple(
+        (str(label), int((target == label).sum())) for label in contract.target_classes
+    )
+    return MulticlassTestPartitionData(
+        frame.loc[:, list(contract.feature_columns)],
+        target,
+        int(len(frame)),
+        counts,
+        contract.test_partition_path,
+        contract.test_partition_sha256,
+    )
+
+
+def _rank_multiclass_confusion_pairs(
+    confusion: Mapping[str, Any], target_classes: Sequence[Any]
+) -> list[dict[str, Any]]:
+    classes = list(target_classes)
+    if list(confusion.get("class_order", ())) != classes:
+        raise FinalizationContractError("Confusion matrix class order differs from contract.")
+    counts = np.asarray(confusion["counts"], dtype=int)
+    normalized = np.asarray(confusion["row_normalized"], dtype=float)
+    if counts.shape != (len(classes), len(classes)):
+        raise FinalizationContractError("Confusion matrix shape differs from contract.")
+    pairs: list[dict[str, Any]] = []
+    for left_index, left in enumerate(classes):
+        for right_index in range(left_index + 1, len(classes)):
+            right = classes[right_index]
+            pairs.append(
+                {
+                    "class_pair": [left, right],
+                    "left_to_right_count": int(counts[left_index, right_index]),
+                    "right_to_left_count": int(counts[right_index, left_index]),
+                    "mutual_confusion_count": int(
+                        counts[left_index, right_index] + counts[right_index, left_index]
+                    ),
+                    "mutual_row_normalized_rate": float(
+                        normalized[left_index, right_index]
+                        + normalized[right_index, left_index]
+                    ),
+                }
+            )
+    pairs.sort(
+        key=lambda row: (
+            -row["mutual_confusion_count"],
+            -row["mutual_row_normalized_rate"],
+            tuple(str(value) for value in row["class_pair"]),
+        )
+    )
+    for rank, row in enumerate(pairs, start=1):
+        row["rank"] = rank
+    return pairs
+
+
+def compare_multiclass_confusion_pairs(
+    *,
+    validation_confusion: Mapping[str, Any],
+    test_confusion: Mapping[str, Any],
+    target_classes: Sequence[Any],
+    focal_pairs: Sequence[Sequence[Any]] = (("DERMASON", "SIRA"), ("BARBUNYA", "CALI")),
+) -> dict[str, Any]:
+    validation_pairs = _rank_multiclass_confusion_pairs(validation_confusion, target_classes)
+    test_pairs = _rank_multiclass_confusion_pairs(test_confusion, target_classes)
+
+    def locate(rows: Sequence[Mapping[str, Any]], pair: Sequence[Any]) -> Mapping[str, Any]:
+        wanted = set(pair)
+        return next(row for row in rows if set(row["class_pair"]) == wanted)
+
+    comparisons = []
+    for pair in focal_pairs:
+        validation = locate(validation_pairs, pair)
+        test = locate(test_pairs, pair)
+        delta = int(test["mutual_confusion_count"] - validation["mutual_confusion_count"])
+        comparisons.append(
+            {
+                "class_pair": list(pair),
+                "validation": _deepcopy(validation),
+                "test": _deepcopy(test),
+                "mutual_confusion_count_delta_test_minus_validation": delta,
+                "pattern_direction": (
+                    "strengthened" if delta > 0 else "weakened" if delta < 0 else "persisted"
+                ),
+                "ranking_changed": test["rank"] != validation["rank"],
+            }
+        )
+    return {
+        "ranked_test_pairs": test_pairs,
+        "focal_pair_comparisons": comparisons,
+        "interpretation_boundary": (
+            "Descriptive generalization evidence only; confusion changes do not reopen model selection."
+        ),
+    }
+
+
+def compute_multiclass_generalization_review(
+    *,
+    validation_evidence: Mapping[str, Any],
+    test_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    validation_metrics = validation_evidence["metrics"]
+    test_metrics = test_evidence["metrics"]
+    metrics = (
+        "macro_f1",
+        "balanced_accuracy",
+        "macro_recall",
+        "weighted_f1",
+        "accuracy",
+        "log_loss",
+    )
+    deltas = {
+        f"{metric}_test_minus_validation": float(test_metrics[metric] - validation_metrics[metric])
+        for metric in metrics
+    }
+    validation_by_class = {
+        str(row["class"]): row for row in validation_evidence["per_class"]
+    }
+    test_by_class = {str(row["class"]): row for row in test_evidence["per_class"]}
+    per_class = [
+        {
+            "class": label,
+            "validation_recall": float(validation_by_class[str(label)]["recall"]),
+            "test_recall": float(test_by_class[str(label)]["recall"]),
+            "recall_delta_test_minus_validation": float(
+                test_by_class[str(label)]["recall"]
+                - validation_by_class[str(label)]["recall"]
+            ),
+        }
+        for label in test_evidence["confusion_matrix"]["class_order"]
+    ]
+    validation_worst = min(validation_evidence["per_class"], key=lambda row: row["recall"])
+    test_worst = min(test_evidence["per_class"], key=lambda row: row["recall"])
+    return {
+        "aggregate_deltas": deltas,
+        "per_class_recall": per_class,
+        "validation_worst_recall_class": validation_worst["class"],
+        "validation_worst_recall": float(validation_worst["recall"]),
+        "test_worst_recall_class": test_worst["class"],
+        "test_worst_recall": float(test_worst["recall"]),
+        "selection_reopened": False,
+        "interpretation": "Descriptive comparison only; no pass/fail gate or post-test adjustment.",
+    }
+
+
+def compute_multiclass_repeated_profile_sensitivity(
+    *,
+    final_training_features: pd.DataFrame,
+    test_features: pd.DataFrame,
+    y_test: pd.Series,
+    predictions: Sequence[Any],
+    probabilities: np.ndarray,
+    target_classes: Sequence[Any],
+    official_metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    if list(final_training_features.columns) != list(test_features.columns):
+        raise FinalizationContractError("Repeated-profile feature order differs.")
+    train_profiles = pd.MultiIndex.from_frame(final_training_features.reset_index(drop=True))
+    test_profiles = pd.MultiIndex.from_frame(test_features.reset_index(drop=True))
+    repeated_mask = test_profiles.isin(train_profiles)
+    keep_mask = ~repeated_mask
+    filtered: Mapping[str, Any] | None = None
+    if int(keep_mask.sum()) > 0:
+        filtered = compute_multiclass_metrics(
+            y_true=y_test.reset_index(drop=True)[keep_mask],
+            y_pred=pd.Series(predictions)[keep_mask],
+            target_classes=target_classes,
+            probabilities=np.asarray(probabilities)[keep_mask],
+            probability_class_order=target_classes,
+        )["metrics"]
+    return {
+        "analysis_type": "non_destructive_repeated_feature_profile_sensitivity",
+        "matching_feature_columns": list(final_training_features.columns),
+        "official_full_test_row_count": int(len(test_features)),
+        "repeated_profile_test_row_count": int(repeated_mask.sum()),
+        "sensitivity_row_count": int(keep_mask.sum()),
+        "official_full_test_metrics": {
+            key: _deepcopy(official_metrics[key])
+            for key in (
+                "macro_f1",
+                "balanced_accuracy",
+                "minimum_per_class_recall",
+                "row_count",
+            )
+        },
+        "excluding_repeated_profile_metrics": (
+            None
+            if filtered is None
+            else {
+                key: _deepcopy(filtered[key])
+                for key in (
+                    "macro_f1",
+                    "balanced_accuracy",
+                    "minimum_per_class_recall",
+                    "row_count",
+                )
+            }
+        ),
+        "macro_f1_delta_excluding_minus_full": (
+            None if filtered is None else float(filtered["macro_f1"] - official_metrics["macro_f1"])
+        ),
+        "interpretation": (
+            "Sensitivity only: the official test artifact remains complete; repeated profiles do not prove duplicate identity or leakage."
+        ),
+    }
+
+
+def evaluate_multiclass_final_model_once(
+    *,
+    fitted_pipeline: Pipeline,
+    test_partition: MulticlassTestPartitionData,
+    final_training_features: pd.DataFrame,
+    contract: MulticlassFrozenFinalizationContract,
+    validation_evidence: Mapping[str, Any],
+    guard: EvaluationGuard,
+) -> MulticlassFinalEvaluation:
+    """Evaluate test exactly once; no search space or alternative candidate is accepted."""
+
+    if guard.evaluated or guard.probability_call_count:
+        raise DuplicateTestEvaluationError("Test probability evaluation was already consumed.")
+    verify_multiclass_pipeline_contract(fitted_pipeline, contract=contract, require_fitted=True)
+    features = test_partition.features
+    target = test_partition.target
+    guard.evaluated = True
+    guard.probability_call_count += 1
+    raw_probabilities = np.asarray(fitted_pipeline.predict_proba(features), dtype=float)
+    estimator_order = list(_jsonable(fitted_pipeline.named_steps["model"].classes_))
+    output_order = list(contract.target_classes)
+    if set(estimator_order) != set(output_order):
+        raise FinalizationContractError("Estimator probability classes differ from target contract.")
+    indices = [estimator_order.index(label) for label in output_order]
+    probabilities = raw_probabilities[:, indices].copy()
+    if probabilities.shape != (test_partition.row_count, len(output_order)):
+        raise FinalizationContractError("Test probability matrix shape differs from contract.")
+    if not np.isfinite(probabilities).all() or not np.allclose(
+        probabilities.sum(axis=1), 1.0, atol=1e-8
+    ):
+        raise FinalizationContractError("Test probabilities are invalid.")
+    predictions = np.asarray(output_order, dtype=object)[np.argmax(probabilities, axis=1)]
+    computed = compute_multiclass_metrics(
+        y_true=target,
+        y_pred=predictions,
+        target_classes=output_order,
+        probabilities=probabilities,
+        probability_class_order=output_order,
+    )
+    generalization = compute_multiclass_generalization_review(
+        validation_evidence=validation_evidence,
+        test_evidence=computed,
+    )
+    pairs = compare_multiclass_confusion_pairs(
+        validation_confusion=validation_evidence["confusion_matrix"],
+        test_confusion=computed["confusion_matrix"],
+        target_classes=output_order,
+    )
+    sensitivity = compute_multiclass_repeated_profile_sensitivity(
+        final_training_features=final_training_features,
+        test_features=features,
+        y_test=target,
+        predictions=predictions,
+        probabilities=probabilities,
+        target_classes=output_order,
+        official_metrics=computed["metrics"],
+    )
+    probability_bytes = pd.DataFrame(probabilities, columns=output_order).to_csv(
+        index=False, lineterminator="\n"
+    ).encode("utf-8")
+    return MulticlassFinalEvaluation(
+        metrics=computed["metrics"],
+        per_class=tuple(computed["per_class"]),
+        confusion_matrix=computed["confusion_matrix"],
+        estimator_class_order=tuple(estimator_order),
+        output_class_order=tuple(output_order),
+        validation_to_test=generalization,
+        confusion_pair_comparison=pairs,
+        repeated_profile_sensitivity=sensitivity,
+        probability_sha256=sha256_bytes(probability_bytes),
+    )
+
+
+def describe_multiclass_fitted_pipeline(
+    *,
+    pipeline: Pipeline,
+    contract: MulticlassFrozenFinalizationContract,
+) -> dict[str, Any]:
+    """Return a fitted-state descriptor that can be recomputed after reload."""
+
+    verify_multiclass_pipeline_contract(pipeline, contract=contract, require_fitted=True)
+    preprocess = pipeline.named_steps["preprocess"]
+    model = pipeline.named_steps["model"]
+    return _jsonable(
+        {
+            "pipeline_class": f"{pipeline.__class__.__module__}.{pipeline.__class__.__name__}",
+            "steps": list(pipeline.named_steps),
+            "preprocess_class": f"{preprocess.__class__.__module__}.{preprocess.__class__.__name__}",
+            "model_class": f"{model.__class__.__module__}.{model.__class__.__name__}",
+            "selected_hyperparameters": dict(contract.hyperparameters),
+            "random_state": contract.random_state,
+            "feature_order": list(contract.feature_columns),
+            "preprocessing_contract": dict(contract.preprocessing_contract),
+            "imbalance_policy": dict(contract.imbalance_policy),
+            "transformed_feature_names": preprocess.get_feature_names_out().tolist(),
+            "estimator_class_order": _jsonable(model.classes_),
+            "output_class_order": list(contract.target_classes),
+            "fitted_state": {
+                "n_iter": int(model.n_iter_),
+                "do_early_stopping": bool(model.do_early_stopping_),
+                "is_fitted": True,
+            },
+            "runtime_versions": runtime_versions(),
+        }
+    )
+
+
+def serialize_multiclass_pipeline_to_staging(
+    *, pipeline: Pipeline, staging_path: str | Path
+) -> str:
+    if not isinstance(pipeline, Pipeline) or not _is_fitted(pipeline):
+        raise SerializationValidationError("Only a fitted multiclass Pipeline can be serialized.")
+    path = Path(staging_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(pipeline, path)
+    return sha256_file(path)
+
+
+def validate_multiclass_serialized_pipeline(
+    *,
+    staging_path: str | Path,
+    expected_sha256: str,
+    contract: MulticlassFrozenFinalizationContract,
+    reference_pipeline: Pipeline,
+    validation_sample: pd.DataFrame,
+) -> Pipeline:
+    path = Path(staging_path)
+    if sha256_file(path) != expected_sha256:
+        raise SerializationValidationError("Serialized multiclass pipeline SHA-256 mismatch.")
+    loaded = joblib.load(path)
+    verify_multiclass_pipeline_contract(loaded, contract=contract, require_fitted=True)
+    sample = validation_sample.loc[:, list(contract.feature_columns)].copy(deep=True)
+    expected_predictions = reference_pipeline.predict(sample)
+    loaded_predictions = loaded.predict(sample)
+    if not np.array_equal(expected_predictions, loaded_predictions):
+        raise SerializationValidationError("Round-trip multiclass predictions differ.")
+    expected_probabilities = reference_pipeline.predict_proba(sample)
+    loaded_probabilities = loaded.predict_proba(sample)
+    if not np.allclose(expected_probabilities, loaded_probabilities, rtol=0.0, atol=0.0):
+        raise SerializationValidationError("Round-trip multiclass probabilities differ.")
+    descriptor = describe_multiclass_fitted_pipeline(pipeline=reference_pipeline, contract=contract)
+    loaded_descriptor = describe_multiclass_fitted_pipeline(pipeline=loaded, contract=contract)
+    if compute_fitted_model_fingerprint(descriptor) != compute_fitted_model_fingerprint(loaded_descriptor):
+        raise SerializationValidationError("Round-trip fitted-state fingerprint differs.")
+    return loaded
+
+
+def validate_multiclass_inference_input(
+    value: Mapping[str, Any] | pd.Series | pd.DataFrame,
+    *,
+    bundle: Mapping[str, Any],
+) -> pd.DataFrame:
+    frame = (
+        value.copy(deep=True)
+        if isinstance(value, pd.DataFrame)
+        else pd.DataFrame([value.to_dict() if isinstance(value, pd.Series) else dict(value)])
+    )
+    required = list(bundle["required_input_columns"])
+    if list(frame.columns) != required:
+        raise FinalizationContractError(
+            f"Inference input columns/order mismatch. expected={required}, observed={list(frame.columns)}"
+        )
+    if frame.isna().any().any():
+        raise FinalizationContractError("Missing required inference values must be rejected.")
+    for column in required:
+        converted = pd.to_numeric(frame[column], errors="coerce")
+        if converted.isna().any() or not np.isfinite(converted.to_numpy(dtype=float)).all():
+            raise FinalizationContractError(f"Inference feature must be finite numeric: {column}")
+        frame[column] = converted
+    return frame
+
+
+def smoke_predict_multiclass_bundle(
+    pipeline: Pipeline,
+    value: Mapping[str, Any] | pd.Series | pd.DataFrame,
+    *,
+    bundle: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Technical v2 smoke inference; this is not Notebook 05's demo workflow."""
+
+    _validate_multiclass_json_artifact("inference-bundle.json", bundle)
+    frame = validate_multiclass_inference_input(value, bundle=bundle)
+    raw = np.asarray(pipeline.predict_proba(frame), dtype=float)
+    estimator_order = list(_jsonable(pipeline.named_steps["model"].classes_))
+    output_order = list(bundle["output_class_order"])
+    if estimator_order != list(bundle["estimator_class_order"]):
+        raise SerializationValidationError("Loaded estimator class order differs from bundle.")
+    if set(estimator_order) != set(output_order):
+        raise SerializationValidationError("Loaded estimator classes differ from output contract.")
+    ordered = raw[:, [estimator_order.index(label) for label in output_order]]
+    if ordered.shape[1] != len(output_order):
+        raise SerializationValidationError("Smoke probability column count differs.")
+    if not np.isfinite(ordered).all() or not np.allclose(ordered.sum(axis=1), 1.0, atol=1e-8):
+        raise SerializationValidationError("Smoke probabilities are invalid.")
+    predicted = np.asarray(output_order, dtype=object)[np.argmax(ordered, axis=1)]
+    rows = []
+    for index, label in enumerate(predicted):
+        rows.append(
+            {
+                "predicted_class": label,
+                "class_order": list(output_order),
+                "class_probabilities": ordered[index].astype(float).tolist(),
+            }
+        )
+    return pd.DataFrame(rows, index=frame.index)
+
+
+def validate_multiclass_upstream_lineage_metadata_only(
+    *,
+    project_root: str | Path,
+    preparation_handoff_path: str | Path,
+    model_selection_handoff_path: str | Path,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Validate upstream bytes and contracts without parsing the test CSV."""
+
+    root = Path(project_root).resolve()
+    preparation_relative = _require_relative_path(
+        preparation_handoff_path, field="preparation_handoff_path"
+    )
+    preparation_path = root / preparation_relative
+    preparation_handoff = _load_json(preparation_path)
+    if preparation_handoff.get("schema_version") != "preparation-handoff.v1":
+        raise UpstreamHandoffError("Preparation handoff schema is invalid.")
+    components = preparation_handoff.get("components", {})
+    required_components = {
+        "preparation_manifest",
+        "feature_manifest",
+        "split_manifest",
+        "quality_evidence",
+    }
+    if set(components) != required_components:
+        raise UpstreamHandoffError("Preparation handoff components are incomplete.")
+    manifests: dict[str, dict[str, Any]] = {"preparation_handoff": preparation_handoff}
+    for name in sorted(required_components):
+        reference = components[name]
+        relative = _require_relative_path(reference["path"], field=f"components.{name}.path")
+        path = root / relative
+        if sha256_file(path) != reference["sha256"]:
+            raise UpstreamHandoffError(f"Preparation component hash mismatch: {name}")
+        manifests[name] = _load_json(path)
+    split = manifests["split_manifest"]
+    for partition in ("train", "validation", "test"):
+        relative = _require_relative_path(
+            split["partition_paths"][partition], field=f"partition_paths.{partition}"
+        )
+        if sha256_file(root / relative) != split["partition_sha256"][partition]:
+            raise UpstreamHandoffError(f"Prepared partition hash mismatch: {partition}")
+    prepared_manifest = manifests["preparation_manifest"]
+    prepared_relative = _require_relative_path(
+        prepared_manifest["prepared_path"], field="prepared_path"
+    )
+    if sha256_file(root / prepared_relative) != prepared_manifest["prepared_sha256"]:
+        raise UpstreamHandoffError("Prepared dataset hash mismatch.")
+
+    selection_relative = _require_relative_path(
+        model_selection_handoff_path, field="model_selection_handoff_path"
+    )
+    selection_path = root / selection_relative
+    selection = _load_json(selection_path)
+    validate_multiclass_finalization_contract(selection)
+    manifest_path = selection_path.parent / "model-selection-manifest.json"
+    selection_manifest = _load_json(manifest_path)
+    if selection_manifest.get("schema_version") != "model-selection-manifest.v2":
+        raise UpstreamHandoffError("Model-selection manifest schema is invalid.")
+    for filename, fingerprint in selection_manifest.get("artifact_fingerprints", {}).items():
+        if sha256_file(selection_path.parent / filename) != fingerprint.get("byte_sha256"):
+            raise UpstreamHandoffError(f"Model-selection artifact hash mismatch: {filename}")
+    preparation_reference = selection.get("preparation_handoff_reference", {})
+    if preparation_reference.get("path") != preparation_relative:
+        raise UpstreamHandoffError("Model-selection preparation lineage path differs.")
+    if sha256_file(preparation_path) != preparation_reference.get("byte_sha256"):
+        raise UpstreamHandoffError("Model-selection preparation lineage hash differs.")
+    feature = manifests["feature_manifest"]
+    if selection.get("available_feature_columns") != feature.get("feature_columns"):
+        raise UpstreamHandoffError("Feature contract differs between handoffs.")
+    if selection.get("target_classes") != feature.get("target_classes"):
+        raise UpstreamHandoffError("Target class order differs between handoffs.")
+    return _deepcopy(manifests), _deepcopy(selection)
+
+
+_validate_upstream_handoff_contracts_v1 = validate_upstream_handoff_contracts
+
+
+def validate_upstream_handoff_contracts(
+    *,
+    project_root: str | Path,
+    model_selection_handoff_path: str | Path,
+    preparation_paths: Mapping[str, str | Path] | None = None,
+    preparation_handoff_path: str | Path | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Load v1 or v2 upstream contracts while preserving the v1 API."""
+
+    root = Path(project_root).resolve()
+    selection_relative = _require_relative_path(
+        model_selection_handoff_path, field="model_selection_handoff_path"
+    )
+    selection_preview = _load_json(root / selection_relative)
+    if selection_preview.get("schema_version") == "model-selection-handoff.v1":
+        if preparation_paths is None:
+            raise UpstreamHandoffError("Binary v1 requires the four preparation paths.")
+        return _validate_upstream_handoff_contracts_v1(
+            project_root=root,
+            preparation_paths=preparation_paths,
+            model_selection_handoff_path=selection_relative,
+        )
+    if selection_preview.get("schema_version") != "model-selection-handoff.v2":
+        raise FinalizationContractError("Unsupported model-selection handoff schema.")
+    if preparation_handoff_path is None:
+        preparation_handoff_path = selection_preview.get("preparation_handoff_reference", {}).get("path")
+    if not isinstance(preparation_handoff_path, (str, Path)):
+        raise UpstreamHandoffError("Multiclass preparation handoff path is missing.")
+    _, selection = validate_multiclass_upstream_lineage_metadata_only(
+        project_root=root,
+        preparation_handoff_path=preparation_handoff_path,
+        model_selection_handoff_path=selection_relative,
+    )
+    preparation = load_and_validate_preparation_handoff(
+        project_root=root,
+        preparation_handoff_path=preparation_handoff_path,
+    )
+    return preparation, selection
+
+
+def build_multiclass_final_test_evidence(
+    *,
+    contract: MulticlassFrozenFinalizationContract,
+    test_partition: MulticlassTestPartitionData,
+    evaluation: MulticlassFinalEvaluation,
+    validation_evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "final-test-evidence.v2",
+        "artifact_type": "final_test_evidence",
+        "dataset_slug": contract.dataset_slug,
+        "problem_type": contract.problem_type,
+        "partition": "test",
+        "partition_path": test_partition.partition_path,
+        "partition_sha256": test_partition.partition_sha256,
+        "row_count": test_partition.row_count,
+        "class_counts": dict(test_partition.class_counts),
+        "frozen_finalization_contract_fingerprint": contract.fingerprint,
+        "metrics": _deepcopy(evaluation.metrics),
+        "per_class": _deepcopy(list(evaluation.per_class)),
+        "confusion_matrix": _deepcopy(evaluation.confusion_matrix),
+        "estimator_class_order": list(evaluation.estimator_class_order),
+        "output_class_order": list(evaluation.output_class_order),
+        "decision_rule": contract.decision_rule,
+        "selected_validation_evidence": {
+            "metrics": _deepcopy(validation_evidence["metrics"]),
+            "per_class": _deepcopy(validation_evidence["per_class"]),
+            "confusion_matrix": _deepcopy(validation_evidence["confusion_matrix"]),
+        },
+        "validation_to_test": _deepcopy(evaluation.validation_to_test),
+        "confusion_pair_comparison": _deepcopy(evaluation.confusion_pair_comparison),
+        "repeated_profile_sensitivity": _deepcopy(evaluation.repeated_profile_sensitivity),
+        "probability_matrix_sha256_aggregate_only": evaluation.probability_sha256,
+        "test_loaded_only_after_final_fit": True,
+        "test_probability_evaluation_count": evaluation.test_probability_evaluation_count,
+        "test_partition_evaluation_count": evaluation.test_probability_evaluation_count,
+        "test_used_for_model_selection": False,
+        "test_used_for_hyperparameter_selection": False,
+        "test_used_for_feature_selection": False,
+        "test_used_for_preprocessing_selection": False,
+        "test_used_for_imbalance_policy_selection": False,
+        "no_post_test_adjustment": True,
+        "individual_rows_persisted": False,
+        "operational_modeling_ready": False,
+        "operational_validity": "unconfirmed",
+    }
+
+
+def build_multiclass_inference_bundle(
+    *,
+    contract: MulticlassFrozenFinalizationContract,
+    fitted_pipeline: Pipeline,
+    model_artifact_path: str,
+    model_artifact_sha256: str,
+    model_state_fingerprint: str,
+    model_state_descriptor: Mapping[str, Any],
+    expected_input_dtypes: Mapping[str, str],
+    missing_value_policy: Mapping[str, Any],
+    upstream_references: Mapping[str, Any],
+    final_artifact_paths: Mapping[str, str],
+) -> dict[str, Any]:
+    verify_multiclass_pipeline_contract(fitted_pipeline, contract=contract, require_fitted=True)
+    estimator_order = list(_jsonable(fitted_pipeline.named_steps["model"].classes_))
+    output_order = list(contract.target_classes)
+    if set(estimator_order) != set(output_order):
+        raise FinalizationContractError("Estimator class set differs from inference output contract.")
+    expected_schema = [
+        {
+            "name": column,
+            "role": "numerical",
+            "required": True,
+            "expected_dtype": expected_input_dtypes[column],
+            "missing_value_behavior": "reject",
+        }
+        for column in contract.feature_columns
+    ]
+    return {
+        "schema_version": "inference-bundle.v2",
+        "artifact_type": "inference_bundle",
+        "bundle_version": "2.0.0",
+        "dataset_slug": contract.dataset_slug,
+        "problem_type": contract.problem_type,
+        "model_id": contract.model_id,
+        "model_family": contract.model_family,
+        "model_artifact_path": _require_relative_path(
+            model_artifact_path, field="model_artifact_path"
+        ),
+        "model_artifact_format": "joblib",
+        "model_artifact_sha256": model_artifact_sha256,
+        "model_state_fingerprint": model_state_fingerprint,
+        "model_state_descriptor": _deepcopy(model_state_descriptor),
+        "selected_hyperparameters": dict(contract.hyperparameters),
+        "estimator_random_state": contract.random_state,
+        "feature_policy": contract.feature_policy,
+        "feature_columns": list(contract.feature_columns),
+        "numerical_features": list(contract.numerical_features),
+        "categorical_features": list(contract.categorical_features),
+        "identifier_columns_excluded": list(contract.identifier_columns),
+        "target_column": contract.target_column,
+        "target_classes": list(contract.target_classes),
+        "target_encoding_metadata_only": dict(contract.target_encoding),
+        "target_semantics": contract.target_semantics,
+        "estimator_class_order": estimator_order,
+        "output_class_order": output_order,
+        "decision_rule": contract.decision_rule,
+        "preprocessing_contract": dict(contract.preprocessing_contract),
+        "imbalance_policy": dict(contract.imbalance_policy),
+        "expected_input_schema": expected_schema,
+        "expected_input_dtypes": _deepcopy(expected_input_dtypes),
+        "required_input_columns": list(contract.feature_columns),
+        "prohibited_input_columns": [*contract.identifier_columns, contract.target_column],
+        "missing_value_policy": _deepcopy(missing_value_policy),
+        "runtime_version_requirements": runtime_versions(),
+        "inference_output_contract": {
+            "predicted_class": {"type": "string", "allowed_values": output_order},
+            "class_order": output_order,
+            "class_probabilities": {
+                "type": "array",
+                "length": len(output_order),
+                "aligned_to": "class_order",
+                "finite": True,
+                "row_sum": 1.0,
+            },
+            "decision_rule": contract.decision_rule,
+            "binary_threshold": "not_applicable",
+            "operational_prediction_available": False,
+        },
+        "lineage": _deepcopy(upstream_references),
+        "artifact_set": {
+            "final_model_manifest_path": final_artifact_paths["final-model-manifest.json"],
+            "final_test_evidence_path": final_artifact_paths["final-test-evidence.json"],
+            "final_model_handoff_path": final_artifact_paths["final-model-handoff.json"],
+        },
+        "test_partition_reference": {
+            "path": contract.test_partition_path,
+            "byte_sha256": contract.test_partition_sha256,
+            "row_count": contract.test_partition_row_count,
+        },
+        "readiness": {
+            "model_artifact_materialized": True,
+            "model_bundle_materialized": True,
+            "serialization_reload_validated": True,
+            "inference_smoke_test_completed": True,
+            "educational_inference_demo_ready": True,
+            "operational_modeling_ready": False,
+        },
+        "limitations": [
+            "Educational static-snapshot model; production validity is unconfirmed.",
+            "Production feature availability, drift monitoring, SLOs, retraining, and deployment validation are absent.",
+            "ShapeFactor2 source provenance remains unresolved despite frozen predictive inclusion.",
+        ],
+        "security_note": "Load joblib only from a trusted source after verifying its exact SHA-256.",
+        "operational_modeling_ready": False,
+        "operational_validity": "unconfirmed",
+    }
+
+
+def build_multiclass_final_model_manifest(
+    *,
+    contract: MulticlassFrozenFinalizationContract,
+    upstream_references: Mapping[str, Any],
+    training_data: MulticlassFinalTrainingData,
+    test_partition: MulticlassTestPartitionData,
+    fit_duration_seconds: float,
+    model_artifact_path: str,
+    model_artifact_sha256: str,
+    model_state_fingerprint: str,
+    model_state_descriptor: Mapping[str, Any],
+    final_artifact_paths: Mapping[str, str],
+    final_artifact_fingerprints: Mapping[str, Mapping[str, str]],
+    analysis_conclusions: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "final-model-manifest.v2",
+        "artifact_type": "final_model_manifest",
+        "dataset_slug": contract.dataset_slug,
+        "problem_type": contract.problem_type,
+        "upstream_references": _deepcopy(upstream_references),
+        "frozen_finalization_contract": contract.as_dict(),
+        "frozen_finalization_contract_fingerprint": contract.fingerprint,
+        "selected_model_id": contract.model_id,
+        "selected_model_family": contract.model_family,
+        "selected_hyperparameters": dict(contract.hyperparameters),
+        "estimator_random_state": contract.random_state,
+        "feature_policy": contract.feature_policy,
+        "feature_columns": list(contract.feature_columns),
+        "numerical_features": list(contract.numerical_features),
+        "categorical_features": list(contract.categorical_features),
+        "identifier_columns": list(contract.identifier_columns),
+        "preprocessing_contract": dict(contract.preprocessing_contract),
+        "imbalance_policy": dict(contract.imbalance_policy),
+        "target_column": contract.target_column,
+        "target_classes": list(contract.target_classes),
+        "target_encoding_metadata_only": dict(contract.target_encoding),
+        "target_semantics": contract.target_semantics,
+        "decision_rule": contract.decision_rule,
+        "estimator_class_order": _deepcopy(model_state_descriptor["estimator_class_order"]),
+        "output_class_order": list(contract.target_classes),
+        "final_training_partitions": list(contract.training_partitions),
+        "final_training_row_count": training_data.row_count,
+        "final_training_class_counts": dict(training_data.class_counts),
+        "test_partition_reference": {
+            "path": test_partition.partition_path,
+            "byte_sha256": test_partition.partition_sha256,
+            "row_count": test_partition.row_count,
+            "class_counts": dict(test_partition.class_counts),
+        },
+        "test_access_policy": {
+            "loaded_after_final_fit": True,
+            "test_evaluation_count": 1,
+            "used_for_adjustment": False,
+        },
+        "model_artifact_path": _require_relative_path(
+            model_artifact_path, field="model_artifact_path"
+        ),
+        "artifact_format": "joblib",
+        "model_artifact_byte_sha256": model_artifact_sha256,
+        "model_state_fingerprint": model_state_fingerprint,
+        "model_state_descriptor": _deepcopy(model_state_descriptor),
+        "fit_duration_seconds": float(fit_duration_seconds),
+        "runtime_versions": runtime_versions(),
+        "final_artifact_paths": _deepcopy(final_artifact_paths),
+        "final_artifact_fingerprints": _deepcopy(final_artifact_fingerprints),
+        "analysis_conclusions": {
+            "shape_factor_2": _deepcopy(analysis_conclusions["shape_factor_2"]),
+            "confirmed_derived_feature_ablation": _deepcopy(
+                analysis_conclusions["confirmed_derived_feature_ablation"]
+            ),
+        },
+        "readiness": {
+            "preparation_handoff_validated": True,
+            "model_selection_handoff_validated": True,
+            "frozen_finalization_contract_validated": True,
+            "final_training_completed": True,
+            "final_model_trained": True,
+            "test_partition_opened_after_final_fit": True,
+            "final_test_evaluation_completed": True,
+            "test_partition_evaluation_count": 1,
+            "test_used_for_adjustment": False,
+            "model_artifact_materialized": True,
+            "model_bundle_materialized": True,
+            "serialization_reload_validated": True,
+            "inference_smoke_test_completed": True,
+            "educational_final_model_completed": True,
+            "educational_inference_demo_ready": True,
+            "final_model_handoff_ready": True,
+            "operational_modeling_ready": False,
+        },
+        "limitations": [
+            "Educational final model completed; production approval is not claimed.",
+            "Operational validity remains unconfirmed.",
+            "ShapeFactor2 source provenance remains unresolved; predictive sensitivity does not resolve source provenance.",
+            "No production data contract, monitoring, SLO, retraining, or deployment validation exists.",
+        ],
+        "operational_modeling_ready": False,
+        "operational_validity": "unconfirmed",
+    }
+
+
+def build_multiclass_final_model_handoff(
+    *,
+    contract: MulticlassFrozenFinalizationContract,
+    upstream_references: Mapping[str, Any],
+    final_references: Mapping[str, Mapping[str, str]],
+    evaluation: MulticlassFinalEvaluation,
+    analysis_conclusions: Mapping[str, Any],
+    runtime_requirements: Mapping[str, str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "final-model-handoff.v2",
+        "artifact_type": "final_model_handoff",
+        "dataset_slug": contract.dataset_slug,
+        "problem_type": contract.problem_type,
+        "upstream_references": _deepcopy(upstream_references),
+        "final_references": _deepcopy(final_references),
+        "frozen_finalization_contract": contract.as_dict(),
+        "frozen_finalization_contract_fingerprint": contract.fingerprint,
+        "model_state_fingerprint": final_references["model_artifact"]["semantic_sha256"],
+        "selected_model_id": contract.model_id,
+        "selected_model_family": contract.model_family,
+        "selected_hyperparameters": dict(contract.hyperparameters),
+        "estimator_random_state": contract.random_state,
+        "feature_policy": contract.feature_policy,
+        "feature_order": list(contract.feature_columns),
+        "preprocessing": dict(contract.preprocessing_contract),
+        "imbalance_policy": dict(contract.imbalance_policy),
+        "target_column": contract.target_column,
+        "target_classes": list(contract.target_classes),
+        "target_encoding_metadata_only": dict(contract.target_encoding),
+        "target_semantics": contract.target_semantics,
+        "decision_rule": contract.decision_rule,
+        "estimator_class_order": list(evaluation.estimator_class_order),
+        "output_class_order": list(evaluation.output_class_order),
+        "final_training_partitions": list(contract.training_partitions),
+        "final_evaluation_partition": contract.evaluation_partition,
+        "final_test_metrics": _deepcopy(evaluation.metrics),
+        "final_test_per_class": _deepcopy(list(evaluation.per_class)),
+        "final_test_confusion_matrix": _deepcopy(evaluation.confusion_matrix),
+        "generalization_evidence": _deepcopy(evaluation.validation_to_test),
+        "confusion_pair_evidence": _deepcopy(evaluation.confusion_pair_comparison),
+        "repeated_profile_sensitivity": _deepcopy(evaluation.repeated_profile_sensitivity),
+        "analysis_conclusions": {
+            "shape_factor_2": _deepcopy(analysis_conclusions["shape_factor_2"]),
+            "confirmed_derived_feature_ablation": _deepcopy(
+                analysis_conclusions["confirmed_derived_feature_ablation"]
+            ),
+        },
+        "runtime_requirements": _deepcopy(runtime_requirements),
+        "notebook_05_instructions": [
+            "Validate final-model-handoff.v2 and inference-bundle.v2 in a new process.",
+            "Verify every sibling hash and the model SHA-256 before trusted joblib loading.",
+            "Do not refit, retune, resplit, or access test.",
+            "Require the 16 numerical features in the frozen order and reject missing values.",
+            "Return predicted_class plus seven probabilities aligned to class_order.",
+            "Keep binary thresholds and positive-class semantics not applicable.",
+        ],
+        "preparation_handoff_validated": True,
+        "model_selection_handoff_validated": True,
+        "frozen_finalization_contract_validated": True,
+        "final_training_completed": True,
+        "educational_final_model_completed": True,
+        "final_model_trained": True,
+        "model_artifact_materialized": True,
+        "model_bundle_materialized": True,
+        "test_partition_opened_after_final_fit": True,
+        "final_test_evaluation_completed": True,
+        "test_partition_evaluated": True,
+        "test_partition_evaluation_count": evaluation.test_probability_evaluation_count,
+        "test_partition_used_for_adjustment": False,
+        "test_partition_used_for_model_selection": False,
+        "test_partition_used_for_feature_selection": False,
+        "test_partition_used_for_hyperparameter_selection": False,
+        "test_partition_used_for_preprocessing_selection": False,
+        "test_partition_used_for_imbalance_policy_selection": False,
+        "no_model_selection_decision_changed_after_test": True,
+        "serialization_reload_validated": True,
+        "inference_smoke_test_completed": True,
+        "final_model_handoff_ready": True,
+        "educational_inference_demo_ready": True,
+        "operational_modeling_ready": False,
+        "operational_validity": "unconfirmed",
+        "api_implemented": False,
+    }
+
+
+def _validate_multiclass_json_artifact(
+    filename: str, payload: Mapping[str, Any]
+) -> None:
+    if filename not in MULTICLASS_FINAL_SCHEMAS:
+        raise FinalizationContractError(f"Unsupported final artifact filename: {filename}")
+    schema, artifact_type = MULTICLASS_FINAL_SCHEMAS[filename]
+    if payload.get("schema_version") != schema or payload.get("artifact_type") != artifact_type:
+        raise FinalizationContractError(f"Invalid multiclass schema/type for {filename}.")
+    if payload.get("problem_type") != "multiclass_classification":
+        raise FinalizationContractError(f"Invalid multiclass problem_type for {filename}.")
+    if payload.get("operational_modeling_ready") is not False:
+        raise FinalizationContractError("Operational modeling readiness must remain false.")
+    if payload.get("operational_validity") != "unconfirmed":
+        raise FinalizationContractError("Operational validity must remain unconfirmed.")
+    _validate_paths_recursively(payload)
+    if filename == "inference-bundle.json":
+        prohibited = {
+            "positive_class",
+            "negative_class",
+            "positive_encoded_label",
+            "positive_class_probability",
+            "educational_decision_threshold",
+            "operational_threshold",
+        }
+        if prohibited & set(payload):
+            raise FinalizationContractError("Multiclass bundle contains binary operational fields.")
+        classes = payload.get("target_classes")
+        if payload.get("output_class_order") != classes or len(classes or ()) < 3:
+            raise FinalizationContractError("Multiclass bundle output class order is invalid.")
+        if set(payload.get("estimator_class_order", ())) != set(classes):
+            raise FinalizationContractError("Multiclass estimator class set is invalid.")
+        output = payload.get("inference_output_contract", {})
+        if output.get("binary_threshold") != "not_applicable":
+            raise FinalizationContractError("Multiclass binary threshold must be not_applicable.")
+    if filename == "final-test-evidence.json":
+        if payload.get("test_partition_evaluation_count") != 1:
+            raise FinalizationContractError("Final test evaluation count must equal one.")
+        if payload.get("no_post_test_adjustment") is not True:
+            raise FinalizationContractError("Final test cannot trigger adjustment.")
+        rendered = canonical_json_bytes(payload)
+        for prohibited in (b"individual_predictions", b"row_predictions", b"individual_probabilities"):
+            if prohibited in rendered:
+                raise FinalizationContractError("Final test evidence contains row-level outputs.")
+    if filename == "final-model-handoff.json":
+        required_true = {
+            "preparation_handoff_validated",
+            "model_selection_handoff_validated",
+            "frozen_finalization_contract_validated",
+            "final_training_completed",
+            "final_model_trained",
+            "test_partition_opened_after_final_fit",
+            "final_test_evaluation_completed",
+            "model_artifact_materialized",
+            "model_bundle_materialized",
+            "serialization_reload_validated",
+            "inference_smoke_test_completed",
+            "final_model_handoff_ready",
+            "educational_inference_demo_ready",
+            "no_model_selection_decision_changed_after_test",
+        }
+        if any(payload.get(key) is not True for key in required_true):
+            raise FinalizationContractError("Multiclass final handoff readiness is incomplete.")
+        if payload.get("test_partition_evaluation_count") != 1:
+            raise FinalizationContractError("Final test evaluation count must equal one.")
+        if payload.get("test_partition_used_for_adjustment") is not False:
+            raise FinalizationContractError("Test cannot be used for adjustment.")
+
+
+def _multiclass_contract_from_bundle(
+    bundle: Mapping[str, Any],
+) -> MulticlassFrozenFinalizationContract:
+    lineage = bundle.get("lineage", {})
+    model_selection = lineage.get("model_selection", {})
+    test = bundle["test_partition_reference"]
+    classes = list(bundle["target_classes"])
+    encoding = bundle["target_encoding_metadata_only"]
+    contract = MulticlassFrozenFinalizationContract(
+        dataset_slug=str(bundle["dataset_slug"]),
+        problem_type=str(bundle["problem_type"]),
+        model_selection_handoff_path=str(model_selection["path"]),
+        model_selection_handoff_sha256=str(model_selection["byte_sha256"]),
+        model_id=str(bundle["model_id"]),
+        model_family=str(bundle["model_family"]),
+        hyperparameters=tuple(sorted(bundle["selected_hyperparameters"].items())),
+        random_state=int(bundle["estimator_random_state"]),
+        feature_policy=str(bundle["feature_policy"]),
+        feature_columns=tuple(bundle["feature_columns"]),
+        numerical_features=tuple(bundle["numerical_features"]),
+        categorical_features=tuple(bundle["categorical_features"]),
+        identifier_columns=tuple(bundle["identifier_columns_excluded"]),
+        target_column=str(bundle["target_column"]),
+        target_classes=tuple(classes),
+        target_encoding=tuple((label, int(encoding[label])) for label in classes),
+        target_semantics=str(bundle["target_semantics"]),
+        preprocessing_contract=tuple(sorted(bundle["preprocessing_contract"].items())),
+        imbalance_policy=tuple(sorted(bundle["imbalance_policy"].items())),
+        decision_rule=str(bundle["decision_rule"]),
+        training_partitions=("train", "validation"),
+        evaluation_partition="test",
+        test_partition_path=str(test["path"]),
+        test_partition_sha256=str(test["byte_sha256"]),
+        test_partition_row_count=int(test["row_count"]),
+    )
+    validate_multiclass_frozen_model_contract(contract)
+    return contract
+
+
+def _validate_multiclass_complete_set(
+    output_directory: str | Path,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    output = Path(output_directory).resolve()
+    if inspect_final_artifact_set(output) != "complete":
+        raise ArtifactConflictError("Multiclass final artifact set is not complete.")
+    payloads = {filename: _load_json(output / filename) for filename in MULTICLASS_FINAL_SCHEMAS}
+    for filename, payload in payloads.items():
+        _validate_multiclass_json_artifact(filename, payload)
+    handoff = payloads["final-model-handoff.json"]
+    bundle = payloads["inference-bundle.json"]
+    manifest = payloads["final-model-manifest.json"]
+    evidence = payloads["final-test-evidence.json"]
+    if len({item.get("dataset_slug") for item in payloads.values()}) != 1:
+        raise ArtifactConflictError("Dataset slug differs within multiclass artifact set.")
+    model_relative = PurePosixPath(
+        _require_relative_path(bundle["model_artifact_path"], field="model_artifact_path")
+    )
+    expected_model_path = (output / "final-pipeline.joblib").resolve()
+    inferred_root = expected_model_path
+    for _ in model_relative.parts:
+        inferred_root = inferred_root.parent
+    if (inferred_root / model_relative).resolve() != expected_model_path:
+        raise ArtifactConflictError("Bundle model path does not identify final-pipeline.joblib.")
+    model_hash = sha256_file(expected_model_path)
+    if model_hash != bundle.get("model_artifact_sha256"):
+        raise ArtifactConflictError("Model bytes differ from multiclass bundle.")
+    for name, reference in handoff.get("final_references", {}).items():
+        relative = _require_relative_path(reference["path"], field=f"final_references.{name}.path")
+        absolute = (inferred_root / relative).resolve()
+        try:
+            absolute.relative_to(inferred_root)
+        except ValueError as exc:
+            raise ArtifactConflictError("Final reference escapes project root.") from exc
+        if not absolute.is_file() or sha256_file(absolute) != reference.get("byte_sha256"):
+            raise ArtifactConflictError(f"Final reference integrity mismatch: {name}")
+    fingerprints = manifest.get("final_artifact_fingerprints", {})
+    expected = {
+        "final-pipeline.joblib": (model_hash, bundle["model_state_fingerprint"]),
+        "final-test-evidence.json": (
+            sha256_file(output / "final-test-evidence.json"),
+            semantic_fingerprint(evidence),
+        ),
+        "inference-bundle.json": (
+            sha256_file(output / "inference-bundle.json"),
+            semantic_fingerprint(bundle),
+        ),
+    }
+    for filename, (byte_hash, semantic_hash) in expected.items():
+        declared = fingerprints.get(filename, {})
+        if declared.get("byte_sha256") != byte_hash or declared.get("semantic_sha256") != semantic_hash:
+            raise ArtifactConflictError(f"Manifest fingerprint mismatch: {filename}")
+    if handoff.get("model_state_fingerprint") != bundle.get("model_state_fingerprint"):
+        raise ArtifactConflictError("Model-state fingerprint differs between handoff and bundle.")
+    if handoff.get("frozen_finalization_contract_fingerprint") != manifest.get(
+        "frozen_finalization_contract_fingerprint"
+    ) or evidence.get("frozen_finalization_contract_fingerprint") != handoff.get(
+        "frozen_finalization_contract_fingerprint"
+    ):
+        raise ArtifactConflictError("Frozen finalization fingerprints are inconsistent.")
+    return handoff, bundle, manifest, evidence
+
+
+def validate_existing_multiclass_finalization_equivalence(
+    *,
+    output_directory: str | Path,
+    contract: MulticlassFrozenFinalizationContract,
+) -> bool:
+    handoff, bundle, _, _ = _validate_multiclass_complete_set(output_directory)
+    checks = {
+        "dataset_slug": contract.dataset_slug,
+        "selected_model_id": contract.model_id,
+        "selected_model_family": contract.model_family,
+        "frozen_finalization_contract_fingerprint": contract.fingerprint,
+    }
+    for key, expected in checks.items():
+        if handoff.get(key) != expected:
+            raise ArtifactConflictError(f"Existing multiclass artifact differs at {key}.")
+    if handoff.get("feature_order") != list(contract.feature_columns):
+        raise ArtifactConflictError("Existing multiclass feature order is divergent.")
+    if handoff.get("selected_hyperparameters") != dict(contract.hyperparameters):
+        raise ArtifactConflictError("Existing multiclass hyperparameters are divergent.")
+    if handoff.get("test_partition_evaluation_count") != 1:
+        raise ArtifactConflictError("Existing final test evaluation count must remain one.")
+    if bundle.get("output_class_order") != list(contract.target_classes):
+        raise ArtifactConflictError("Existing output class order is divergent.")
+    return True
+
+
+def write_multiclass_final_model_artifacts(
+    *,
+    project_root: str | Path,
+    output_directory: str | Path,
+    pipeline: Pipeline,
+    contract: MulticlassFrozenFinalizationContract,
+    training_data: MulticlassFinalTrainingData,
+    test_partition: MulticlassTestPartitionData,
+    evaluation: MulticlassFinalEvaluation,
+    validation_evidence: Mapping[str, Any],
+    fit_duration_seconds: float,
+    upstream_references: Mapping[str, Any],
+    expected_input_dtypes: Mapping[str, str],
+    missing_value_policy: Mapping[str, Any],
+    analysis_conclusions: Mapping[str, Any],
+) -> ArtifactWriteResult:
+    """Atomically materialize the v2 joblib plus four schema-aware JSONs."""
+
+    root = Path(project_root).resolve()
+    relative_output = _require_relative_path(output_directory, field="output_directory")
+    output = (root / relative_output).resolve()
+    try:
+        output.relative_to(root)
+    except ValueError as exc:
+        raise FinalizationContractError("Output directory escapes project root.") from exc
+    state = inspect_final_artifact_set(output)
+    if state == "partial":
+        raise ArtifactConflictError("Partial final artifact set detected; refusing repair.")
+    if state == "complete":
+        validate_existing_multiclass_finalization_equivalence(
+            output_directory=output, contract=contract
+        )
+        byte_hashes = {
+            name: sha256_file(output / name) for name in FINAL_ARTIFACT_FILENAMES
+        }
+        semantic_hashes = {
+            name: semantic_fingerprint(_load_json(output / name))
+            for name in MULTICLASS_FINAL_SCHEMAS
+        }
+        semantic_hashes["final-pipeline.joblib"] = _load_json(
+            output / "inference-bundle.json"
+        )["model_state_fingerprint"]
+        return ArtifactWriteResult(output, (), (), True, byte_hashes, semantic_hashes)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(tempfile.mkdtemp(prefix=".final-model-v2-staging-", dir=output.parent))
+    backup_root = Path(tempfile.mkdtemp(prefix=".final-model-v2-backup-", dir=output.parent))
+    staging = staging_root / output.name
+    staging.mkdir(parents=True, exist_ok=True)
+    promoted: list[str] = []
+    backed_up: list[str] = []
+    try:
+        descriptor = describe_multiclass_fitted_pipeline(
+            pipeline=pipeline, contract=contract
+        )
+        state_fingerprint = compute_fitted_model_fingerprint(descriptor)
+        model_staging = staging / "final-pipeline.joblib"
+        model_hash = serialize_multiclass_pipeline_to_staging(
+            pipeline=pipeline, staging_path=model_staging
+        )
+        sample = training_data.features.iloc[: min(32, training_data.row_count)].copy(deep=True)
+        reloaded = validate_multiclass_serialized_pipeline(
+            staging_path=model_staging,
+            expected_sha256=model_hash,
+            contract=contract,
+            reference_pipeline=pipeline,
+            validation_sample=sample,
+        )
+        paths = {
+            name: f"{relative_output}/{name}" for name in FINAL_ARTIFACT_FILENAMES
+        }
+        evidence = build_multiclass_final_test_evidence(
+            contract=contract,
+            test_partition=test_partition,
+            evaluation=evaluation,
+            validation_evidence=validation_evidence,
+        )
+        bundle = build_multiclass_inference_bundle(
+            contract=contract,
+            fitted_pipeline=pipeline,
+            model_artifact_path=paths["final-pipeline.joblib"],
+            model_artifact_sha256=model_hash,
+            model_state_fingerprint=state_fingerprint,
+            model_state_descriptor=descriptor,
+            expected_input_dtypes=expected_input_dtypes,
+            missing_value_policy=missing_value_policy,
+            upstream_references=upstream_references,
+            final_artifact_paths=paths,
+        )
+        smoke = smoke_predict_multiclass_bundle(reloaded, sample.iloc[:8], bundle=bundle)
+        if len(smoke) != min(8, len(sample)):
+            raise SerializationValidationError("Multiclass serialization smoke row count differs.")
+
+        fingerprints: dict[str, dict[str, str]] = {
+            "final-pipeline.joblib": {
+                "byte_sha256": model_hash,
+                "semantic_sha256": state_fingerprint,
+            }
+        }
+        for filename, payload in {
+            "final-test-evidence.json": evidence,
+            "inference-bundle.json": bundle,
+        }.items():
+            _validate_multiclass_json_artifact(filename, payload)
+            content = canonical_json_text(payload).encode("utf-8")
+            (staging / filename).write_bytes(content)
+            fingerprints[filename] = {
+                "byte_sha256": sha256_bytes(content),
+                "semantic_sha256": semantic_fingerprint(payload),
+            }
+        manifest = build_multiclass_final_model_manifest(
+            contract=contract,
+            upstream_references=upstream_references,
+            training_data=training_data,
+            test_partition=test_partition,
+            fit_duration_seconds=fit_duration_seconds,
+            model_artifact_path=paths["final-pipeline.joblib"],
+            model_artifact_sha256=model_hash,
+            model_state_fingerprint=state_fingerprint,
+            model_state_descriptor=descriptor,
+            final_artifact_paths=paths,
+            final_artifact_fingerprints=fingerprints,
+            analysis_conclusions=analysis_conclusions,
+        )
+        _validate_multiclass_json_artifact("final-model-manifest.json", manifest)
+        manifest_content = canonical_json_text(manifest).encode("utf-8")
+        (staging / "final-model-manifest.json").write_bytes(manifest_content)
+        fingerprints["final-model-manifest.json"] = {
+            "byte_sha256": sha256_bytes(manifest_content),
+            "semantic_sha256": semantic_fingerprint(manifest),
+        }
+        final_references = {
+            "model_artifact": {
+                "path": paths["final-pipeline.joblib"],
+                **fingerprints["final-pipeline.joblib"],
+            },
+            "final_model_manifest": {
+                "path": paths["final-model-manifest.json"],
+                **fingerprints["final-model-manifest.json"],
+            },
+            "final_test_evidence": {
+                "path": paths["final-test-evidence.json"],
+                **fingerprints["final-test-evidence.json"],
+            },
+            "inference_bundle": {
+                "path": paths["inference-bundle.json"],
+                **fingerprints["inference-bundle.json"],
+            },
+        }
+        handoff = build_multiclass_final_model_handoff(
+            contract=contract,
+            upstream_references=upstream_references,
+            final_references=final_references,
+            evaluation=evaluation,
+            analysis_conclusions=analysis_conclusions,
+            runtime_requirements=runtime_versions(),
+        )
+        _validate_multiclass_json_artifact("final-model-handoff.json", handoff)
+        handoff_content = canonical_json_text(handoff).encode("utf-8")
+        (staging / "final-model-handoff.json").write_bytes(handoff_content)
+        fingerprints["final-model-handoff.json"] = {
+            "byte_sha256": sha256_bytes(handoff_content),
+            "semantic_sha256": semantic_fingerprint(handoff),
+        }
+        for filename in MULTICLASS_FINAL_SCHEMAS:
+            _validate_multiclass_json_artifact(filename, _load_json(staging / filename))
+        if sha256_file(model_staging) != bundle["model_artifact_sha256"]:
+            raise SerializationValidationError("Staged bundle/model hash mismatch.")
+
+        output.mkdir(parents=True, exist_ok=True)
+        for filename in FINAL_ARTIFACT_FILENAMES:
+            destination = output / filename
+            if destination.exists():
+                backup = backup_root / filename
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(destination, backup)
+                backed_up.append(filename)
+            os.replace(staging / filename, destination)
+            promoted.append(filename)
+
+        _validate_multiclass_complete_set(output)
+        loaded_bundle = load_and_validate_inference_bundle(
+            project_root=root, bundle_path=paths["inference-bundle.json"]
+        )
+        trusted = load_trusted_pipeline_from_bundle(
+            project_root=root, bundle=loaded_bundle
+        )
+        trusted_smoke = smoke_predict_multiclass_bundle(
+            trusted, sample.iloc[:8], bundle=loaded_bundle
+        )
+        if trusted_smoke["predicted_class"].tolist() != smoke["predicted_class"].tolist():
+            raise SerializationValidationError("Post-promotion smoke predictions differ.")
+        load_and_validate_final_model_handoff(
+            project_root=root, handoff_path=paths["final-model-handoff.json"]
+        )
+        byte_hashes = {
+            name: sha256_file(output / name) for name in FINAL_ARTIFACT_FILENAMES
+        }
+        semantic_hashes = {
+            **{
+                name: values["semantic_sha256"]
+                for name, values in fingerprints.items()
+            }
+        }
+        return ArtifactWriteResult(
+            output,
+            tuple(promoted),
+            (),
+            False,
+            byte_hashes,
+            semantic_hashes,
+        )
+    except Exception:
+        for filename in reversed(promoted):
+            destination = output / filename
+            if destination.exists():
+                destination.unlink()
+        for filename in reversed(backed_up):
+            backup = backup_root / filename
+            destination = output / filename
+            if backup.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(backup, destination)
+        raise
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        shutil.rmtree(backup_root, ignore_errors=True)
+
+
+_load_and_validate_inference_bundle_v1 = load_and_validate_inference_bundle
+_load_and_validate_final_model_handoff_v1 = load_and_validate_final_model_handoff
+_load_trusted_pipeline_from_bundle_v1 = load_trusted_pipeline_from_bundle
+
+
+def load_and_validate_inference_bundle(
+    *, project_root: str | Path, bundle_path: str | Path
+) -> dict[str, Any]:
+    """Load either inference-bundle.v1 or genuine multiclass v2."""
+
+    root = Path(project_root).resolve()
+    relative = _require_relative_path(bundle_path, field="bundle_path")
+    path = (root / relative).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Inference bundle not found: {relative}")
+    preview = _load_json(path)
+    if preview.get("schema_version") == "inference-bundle.v1":
+        return _load_and_validate_inference_bundle_v1(
+            project_root=root, bundle_path=relative
+        )
+    if preview.get("schema_version") != "inference-bundle.v2":
+        raise FinalizationContractError("Unsupported inference bundle schema.")
+    _, bundle, _, _ = _validate_multiclass_complete_set(path.parent)
+    return _deepcopy(bundle)
+
+
+def load_and_validate_final_model_handoff(
+    *, project_root: str | Path, handoff_path: str | Path
+) -> dict[str, Any]:
+    """Load either final-model-handoff.v1 or multiclass v2 with sibling integrity."""
+
+    root = Path(project_root).resolve()
+    relative = _require_relative_path(handoff_path, field="handoff_path")
+    path = (root / relative).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Final model handoff not found: {relative}")
+    preview = _load_json(path)
+    if preview.get("schema_version") == "final-model-handoff.v1":
+        return _load_and_validate_final_model_handoff_v1(
+            project_root=root, handoff_path=relative
+        )
+    if preview.get("schema_version") != "final-model-handoff.v2":
+        raise FinalizationContractError("Unsupported final model handoff schema.")
+    handoff, _, _, _ = _validate_multiclass_complete_set(path.parent)
+    return _deepcopy(handoff)
+
+
+def load_and_validate_final_model_manifest(
+    *, project_root: str | Path, manifest_path: str | Path
+) -> dict[str, Any]:
+    root = Path(project_root).resolve()
+    relative = _require_relative_path(manifest_path, field="manifest_path")
+    path = root / relative
+    payload = _load_json(path)
+    if payload.get("schema_version") == "final-model-manifest.v2":
+        _, _, manifest, _ = _validate_multiclass_complete_set(path.parent)
+        return _deepcopy(manifest)
+    _validate_json_artifact("final-model-manifest.json", payload)
+    return _deepcopy(payload)
+
+
+def load_and_validate_final_test_evidence(
+    *, project_root: str | Path, evidence_path: str | Path
+) -> dict[str, Any]:
+    root = Path(project_root).resolve()
+    relative = _require_relative_path(evidence_path, field="evidence_path")
+    path = root / relative
+    payload = _load_json(path)
+    if payload.get("schema_version") == "final-test-evidence.v2":
+        _, _, _, evidence = _validate_multiclass_complete_set(path.parent)
+        return _deepcopy(evidence)
+    _validate_json_artifact("final-test-evidence.json", payload)
+    return _deepcopy(payload)
+
+
+def load_trusted_pipeline_from_bundle(
+    *, project_root: str | Path, bundle: Mapping[str, Any]
+) -> Pipeline:
+    """Verify v1/v2 bytes first, then validate the fitted state after joblib load."""
+
+    if bundle.get("schema_version") == "inference-bundle.v1":
+        return _load_trusted_pipeline_from_bundle_v1(
+            project_root=project_root, bundle=bundle
+        )
+    _validate_multiclass_json_artifact("inference-bundle.json", bundle)
+    root = Path(project_root).resolve()
+    relative = _require_relative_path(bundle["model_artifact_path"], field="model_artifact_path")
+    path = (root / relative).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Model artifact not found: {relative}")
+    if sha256_file(path) != bundle["model_artifact_sha256"]:
+        raise UntrustedArtifactError("Refusing to load multiclass joblib with divergent SHA-256.")
+    loaded = joblib.load(path)
+    contract = _multiclass_contract_from_bundle(bundle)
+    verify_multiclass_pipeline_contract(loaded, contract=contract, require_fitted=True)
+    descriptor = describe_multiclass_fitted_pipeline(pipeline=loaded, contract=contract)
+    fingerprint = compute_fitted_model_fingerprint(descriptor)
+    if descriptor != bundle.get("model_state_descriptor"):
+        raise SerializationValidationError("Loaded multiclass fitted-state descriptor differs.")
+    if fingerprint != bundle.get("model_state_fingerprint"):
+        raise SerializationValidationError("Loaded multiclass fitted-state fingerprint differs.")
+    return loaded
