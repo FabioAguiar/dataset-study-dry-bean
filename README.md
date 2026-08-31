@@ -1,4 +1,4 @@
-# Dry Bean Dataset Study
+# Dry Bean — Dataset Study
 
 End-to-end reproducible educational study of the UCI Dry Bean dataset, covering source validation, exploratory evidence, deterministic preparation, multiclass model selection, feature-policy sensitivity, sealed final holdout evaluation, model bundling, and trusted independent inference.
 
