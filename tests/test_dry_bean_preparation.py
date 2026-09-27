@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 from pathlib import Path
 
@@ -14,7 +15,10 @@ from scripts.prepare_data import (
     ClassificationSplitPolicy,
     DatasetValidationError,
     HandoffValidationError,
+    PartitionValidationError,
+    SplitPolicyError,
     analyze_repeated_profiles_across_partitions,
+    build_development_split_reference,
     build_feature_manifest,
     build_preparation_handoff_manifest,
     build_preparation_manifest,
@@ -28,6 +32,7 @@ from scripts.prepare_data import (
     separate_dataset_roles,
     split_classification_dataset,
     validate_dataset_partitions,
+    validate_partitions_against_development_split,
     validate_prepared_dataset,
     validate_raw_dataset,
     validate_source_against_exploration_handoff,
@@ -106,7 +111,7 @@ def split_policy() -> ClassificationSplitPolicy:
 
 def exploration_handoff(source: Path, frame: pd.DataFrame) -> dict[str, object]:
     return {
-        "schema_version": "exploration-handoff.v1",
+        "schema_version": "exploration-handoff.v2",
         "artifact_type": "exploration_handoff",
         "dataset_slug": "dry-bean",
         "source": {
@@ -412,6 +417,67 @@ def test_identifier_free_split_preserves_duplicates_and_is_reproducible() -> Non
     assert sum((part == frame.iloc[0]).all(axis=1).sum() for part in first.as_mapping().values()) == 3
     for partition in first.as_mapping().values():
         assert set(partition[TARGET]) == set(CLASSES)
+
+
+def test_development_split_reference_is_reproduced_by_preparation() -> None:
+    frame = make_dry_bean_frame()
+    frozen = split_classification_dataset(
+        frame, policy=split_policy(), identifier_columns=(), target_classes=CLASSES
+    )
+    reference = build_development_split_reference(frozen, policy=split_policy())
+
+    assert reference["split_frozen_before_distribution_aware_analysis"] is True
+    assert reference["eda_partition"] == "train"
+    assert reference["eda_row_count"] == len(frozen.train)
+    assert reference["held_out_partitions_used_for_eda"] == []
+    assert sum(reference["row_counts"].values()) == len(frame)
+    assert set(reference["partition_sha256"]) == {"train", "validation", "test"}
+
+    prepared = prepare_tabular_dataset(frame).dataframe
+    rebuilt = split_classification_dataset(
+        prepared, policy=split_policy(), identifier_columns=(), target_classes=CLASSES
+    )
+    verification = validate_partitions_against_development_split(
+        rebuilt, policy=split_policy(), reference=reference
+    )
+    assert verification["reproduces_split_frozen_before_eda"] is True
+    assert all(verification["checks"].values())
+
+
+def test_development_split_mismatch_fails_closed() -> None:
+    frame = make_dry_bean_frame()
+    frozen = split_classification_dataset(
+        frame, policy=split_policy(), identifier_columns=(), target_classes=CLASSES
+    )
+    reference = build_development_split_reference(frozen, policy=split_policy())
+    other_policy = dataclasses.replace(split_policy(), random_seed=7)
+    reshuffled = split_classification_dataset(
+        frame, policy=other_policy, identifier_columns=(), target_classes=CLASSES
+    )
+    with pytest.raises(PartitionValidationError, match="frozen before exploration"):
+        validate_partitions_against_development_split(
+            reshuffled, policy=split_policy(), reference=reference
+        )
+
+    tampered = copy.deepcopy(reference)
+    tampered["held_out_partitions_used_for_eda"] = ["test"]
+    with pytest.raises(PartitionValidationError, match="Held-out"):
+        validate_partitions_against_development_split(
+            frozen, policy=split_policy(), reference=tampered
+        )
+
+
+def test_development_split_reference_rejects_test_as_eda_partition() -> None:
+    frozen = split_classification_dataset(
+        make_dry_bean_frame(),
+        policy=split_policy(),
+        identifier_columns=(),
+        target_classes=CLASSES,
+    )
+    with pytest.raises(SplitPolicyError, match="final test"):
+        build_development_split_reference(
+            frozen, policy=split_policy(), eda_partition="test"
+        )
 
 
 def test_repeated_profile_evidence_is_epistemically_bounded() -> None:

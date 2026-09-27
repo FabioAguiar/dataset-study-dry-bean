@@ -1070,14 +1070,17 @@ def record_static_multiclass_preparation_decisions(
                 f"with stratification by {target_name} and random seed {random_seed}."
             ),
             (
-                "The released table has no chronological evaluation field, while "
-                "unequal multiclass support makes stratification important."
+                "The released table has no chronological evaluation field and a "
+                "nominal multiclass target; class stratification keeps every class "
+                "represented. The split is frozen before any distribution-aware or "
+                "target-aware exploration."
             ),
             (
                 "Partitions are reproducible, disjoint, preserve every target class, "
-                "and keep the final test holdout untouched."
+                "match the membership frozen before exploration, and keep the final "
+                "test holdout untouched."
             ),
-            ("10", "15", "17"),
+            ("5", "9b"),
             ("PREP-001", "PREP-003"),
         ),
         decision(
@@ -1156,15 +1159,17 @@ def record_static_multiclass_preparation_decisions(
             "Split",
             "None",
             (
-                "Perform the approved split before fitting scalers, selectors, "
-                "resampling strategies, target-aware rankings, or model parameters."
+                "Perform the approved split before distribution-aware or target-aware "
+                "exploration and before fitting scalers, selectors, resampling "
+                "strategies, target-aware rankings, or model parameters."
             ),
-            "Held-out partitions must not influence learned preparation choices.",
+            "Held-out partitions must not influence exploratory or learned preparation choices.",
             (
-                "All learned operations record train-only fit scope and the final "
-                "test partition is used only after the model contract is frozen."
+                "Exploration records a training-only scope, all learned operations "
+                "record train-only fit scope, and the final test partition is used "
+                "only after the model contract is frozen."
             ),
-            ("15", "17"),
+            ("9b", "15", "17"),
             ("PREP-005",),
         ),
     ]

@@ -12,6 +12,7 @@ import pytest
 from scripts.build_exploration_handoff import (
     ExplorationHandoffError,
     build_static_multiclass_exploration_handoff,
+    development_feature_evidence,
     load_and_validate_exploration_handoff,
 )
 
@@ -212,15 +213,56 @@ class RelationshipReport:
     )
 
 
+class ClassProfileReport:
+    row_count = 13
+
+    def pairwise_overlap_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "Class A": "B",
+                    "Class B": "C",
+                    "Mean IQR overlap coefficient": 0.4,
+                    "RMS robust median gap": 0.5,
+                },
+                {
+                    "Class A": "A",
+                    "Class B": "B",
+                    "Mean IQR overlap coefficient": 0.1,
+                    "RMS robust median gap": 1.5,
+                },
+            ]
+        )
+
+
+SOURCE_ROWS = 19
+
+
 def source_dataframe() -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "Area": [1, 2, 3],
-            "Perimeter": [2.0, 3.0, 4.0],
-            "Compactness": [0.7, 0.8, 0.9],
-            "Class": ["A", "B", "C"],
+            "Area": [float(index + 1) for index in range(SOURCE_ROWS)],
+            "Perimeter": [float(index + 2) for index in range(SOURCE_ROWS)],
+            "Compactness": [0.7] * SOURCE_ROWS,
+            "Class": [CLASSES[index % 3] for index in range(SOURCE_ROWS)],
         }
     )
+
+
+def development_split(**overrides) -> dict:
+    payload = {
+        "schema_version": "development-split.v1",
+        "split_frozen_before_distribution_aware_analysis": True,
+        "policy": {"random_seed": 42},
+        "row_counts": {"train": 13, "validation": 3, "test": 3},
+        "partition_sha256": {"train": "a" * 64, "validation": "b" * 64, "test": "c" * 64},
+        "membership_sha256": {"train": "d" * 64, "validation": "e" * 64, "test": "f" * 64},
+        "eda_partition": "train",
+        "eda_row_count": 13,
+        "held_out_partitions_used_for_eda": [],
+    }
+    payload.update(overrides)
+    return payload
 
 
 def build_report(tmp_path: Path, **overrides):
@@ -252,6 +294,8 @@ def build_report(tmp_path: Path, **overrides):
         "quality_report": QualityReport(),
         "insights_report": InsightsReport(),
         "preparation_report": PreparationReport(),
+        "class_profile_report": ClassProfileReport(),
+        "development_split": development_split(),
     }
     params.update(overrides)
     return build_static_multiclass_exploration_handoff(**params)
@@ -262,7 +306,7 @@ def test_builds_ready_portable_handoff(tmp_path: Path) -> None:
 
     assert report.is_structurally_valid
     assert report.is_handoff_ready
-    assert report.payload["schema_version"] == "exploration-handoff.v1"
+    assert report.payload["schema_version"] == "exploration-handoff.v2"
     assert report.payload["source"]["dataset_id"] == 602
     assert report.payload["source"]["path"] == "dataset.csv"
     assert report.payload["prediction_contract"]["positive_class"] is None
@@ -399,3 +443,92 @@ def test_loader_rejects_wrong_source_dataset_id(tmp_path: Path) -> None:
             destination,
             expected_source_dataset_id=999,
         )
+
+
+def test_handoff_records_split_frozen_before_train_only_eda(tmp_path: Path) -> None:
+    report = build_report(tmp_path)
+
+    split = report.payload["development_split"]
+    assert split["split_frozen_before_distribution_aware_analysis"] is True
+    assert split["eda_partition"] == "train"
+    assert split["eda_row_count"] == 13
+    assert split["held_out_partitions_used_for_eda"] == []
+    assert split["distribution_aware_reports_scope"] == "train"
+    assert report.payload["class_overlap"]["highest_overlap_pair"] == ["B", "C"]
+
+
+@pytest.mark.parametrize(
+    ("override", "issue"),
+    [
+        ({"eda_partition": "test", "eda_row_count": 3}, "Unexpected EDA partition"),
+        ({"held_out_partitions_used_for_eda": ["test"]}, "Held-out data used in EDA"),
+        ({"split_frozen_before_distribution_aware_analysis": False}, "Split not frozen"),
+        ({"row_counts": {"train": 13, "validation": 3, "test": 4}}, "do not cover the source"),
+    ],
+)
+def test_development_split_violations_block_handoff(
+    tmp_path: Path, override: dict, issue: str
+) -> None:
+    report = build_report(tmp_path, development_split=development_split(**override))
+
+    assert not report.is_handoff_ready
+    assert report.issues_frame()["Issue"].str.contains(issue).any()
+
+
+def test_full_source_target_exploration_is_rejected(tmp_path: Path) -> None:
+    class FullSourceTargetReport(TargetReport):
+        def distribution_frame(self, *, format_percentages: bool = False) -> pd.DataFrame:
+            frame = super().distribution_frame(format_percentages=format_percentages)
+            frame["Count"] = [7, 6, 6]
+            return frame
+
+    report = build_report(tmp_path, target_report=FullSourceTargetReport())
+
+    assert not report.is_handoff_ready
+    assert report.issues_frame()["Issue"].str.contains(
+        "Target exploration scope differs"
+    ).any()
+
+
+def test_distribution_aware_report_row_count_must_match_eda_partition(
+    tmp_path: Path,
+) -> None:
+    profile = ClassProfileReport()
+    profile.row_count = SOURCE_ROWS  # type: ignore[misc]
+
+    report = build_report(tmp_path, class_profile_report=profile)
+
+    assert not report.is_handoff_ready
+    assert report.issues_frame()["Details"].str.contains("class_profile_report").any()
+
+
+def test_loader_requires_train_only_development_split(tmp_path: Path) -> None:
+    report = build_report(tmp_path)
+    destination = tmp_path / "handoff.json"
+    report.write(destination)
+
+    payload = json.loads(destination.read_text(encoding="utf-8"))
+    payload["development_split"]["eda_partition"] = "validation"
+    destination.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ExplorationHandoffError, match="training partition only"):
+        load_and_validate_exploration_handoff(destination)
+
+    del payload["development_split"]
+    destination.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ExplorationHandoffError, match="development_split"):
+        load_and_validate_exploration_handoff(destination)
+
+
+def test_development_feature_evidence_summarizes_train_only_governance(
+    tmp_path: Path,
+) -> None:
+    report = build_report(tmp_path)
+
+    evidence = development_feature_evidence(report.payload)
+
+    assert evidence["eda_partition"] == "train"
+    assert evidence["eda_row_count"] == 13
+    assert evidence["held_out_partitions_used_for_eda"] == []
+    assert evidence["confirmed_derived_features"] == ["Compactness"]
+    assert evidence["unresolved_provenance_features"] == ["Perimeter"]
+    assert evidence["highest_overlap_class_pair"] == ["B", "C"]

@@ -507,11 +507,32 @@ def test_confusion_pair_comparison_tracks_frozen_pairs():
         validation_confusion=evidence["confusion_matrix"],
         test_confusion=evidence["confusion_matrix"],
         target_classes=CLASSES,
+        focal_pairs=(("DERMASON", "SIRA"), ("BARBUNYA", "CALI"), ("SIRA", "DERMASON")),
     )
     assert [row["class_pair"] for row in comparison["focal_pair_comparisons"]] == [
         ["DERMASON", "SIRA"], ["BARBUNYA", "CALI"]
     ]
     assert all(row["pattern_direction"] == "persisted" for row in comparison["focal_pair_comparisons"])
+
+
+def test_confusion_pair_comparison_defaults_to_top_validation_pair():
+    frame = make_frame(2)
+    evidence = validation_evidence(frame)
+    comparison = compare_multiclass_confusion_pairs(
+        validation_confusion=evidence["confusion_matrix"],
+        test_confusion=evidence["confusion_matrix"],
+        target_classes=CLASSES,
+    )
+    focal = comparison["focal_pair_comparisons"]
+    assert len(focal) == 1
+    assert focal[0]["validation"]["rank"] == 1
+    with pytest.raises(FinalizationContractError, match="focal class pair"):
+        compare_multiclass_confusion_pairs(
+            validation_confusion=evidence["confusion_matrix"],
+            test_confusion=evidence["confusion_matrix"],
+            target_classes=CLASSES,
+            focal_pairs=(("SEKER", "SEKER"),),
+        )
 
 
 def test_repeated_profile_sensitivity_is_non_destructive(tmp_path, base_contract, fitted, frames):

@@ -1,0 +1,701 @@
+{
+  "artifact_type": "canonical_reference_run",
+  "cross_validation": {
+    "fit_partition": "train_only",
+    "n_splits": 5,
+    "random_state": 42,
+    "shuffle": true,
+    "strategy": "StratifiedKFold"
+  },
+  "dataset": {
+    "dataset_doi": "10.24432/C50S4B",
+    "name": "Dry Bean",
+    "repository": "UCI Machine Learning Repository",
+    "slug": "dry-bean",
+    "source_column_count": 17,
+    "source_file": "data/raw/dry-bean/dataset.csv",
+    "source_row_count": 13611,
+    "source_sha256": "1330e4ccc5c54a925e43daf60d1409ac62dad2a21de9a25213765bee4b655787",
+    "uci_dataset_id": 602
+  },
+  "features": {
+    "categorical": [],
+    "count": 16,
+    "identifiers": [],
+    "numerical": [
+      "Area",
+      "Perimeter",
+      "MajorAxisLength",
+      "MinorAxisLength",
+      "AspectRatio",
+      "Eccentricity",
+      "ConvexArea",
+      "EquivDiameter",
+      "Extent",
+      "Solidity",
+      "Roundness",
+      "Compactness",
+      "ShapeFactor1",
+      "ShapeFactor2",
+      "ShapeFactor3",
+      "ShapeFactor4"
+    ],
+    "ordered_columns": [
+      "Area",
+      "Perimeter",
+      "MajorAxisLength",
+      "MinorAxisLength",
+      "AspectRatio",
+      "Eccentricity",
+      "ConvexArea",
+      "EquivDiameter",
+      "Extent",
+      "Solidity",
+      "Roundness",
+      "Compactness",
+      "ShapeFactor1",
+      "ShapeFactor2",
+      "ShapeFactor3",
+      "ShapeFactor4"
+    ]
+  },
+  "final_model": {
+    "artifact_format": "joblib",
+    "artifact_path": "artifacts/models/dry-bean/final-pipeline.joblib",
+    "artifact_sha256": "b7d8aa9c5846237c58d4e9cd05ed451cad3d36931822d1b74da28c3d8db1e478",
+    "fit_class_counts": {
+      "BARBUNYA": 1123,
+      "BOMBAY": 444,
+      "CALI": 1386,
+      "DERMASON": 3014,
+      "HOROZ": 1639,
+      "SEKER": 1723,
+      "SIRA": 2240
+    },
+    "fit_row_count": 11569,
+    "frozen_finalization_contract_fingerprint": "81e7de5f50f191d81a113e411ca2a6be9400ebb52d1307a934d20b1636f9dc1b",
+    "model_state_fingerprint": "0f301110a38db2e60d3c41432c69cc7458e301fd8865858f3ac9b853b87909aa"
+  },
+  "final_test": {
+    "confusion_matrix": {
+      "class_order": [
+        "SEKER",
+        "BARBUNYA",
+        "BOMBAY",
+        "CALI",
+        "DERMASON",
+        "HOROZ",
+        "SIRA"
+      ],
+      "counts": [
+        [
+          291,
+          0,
+          0,
+          0,
+          8,
+          0,
+          5
+        ],
+        [
+          3,
+          178,
+          0,
+          12,
+          0,
+          2,
+          4
+        ],
+        [
+          0,
+          0,
+          78,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          7,
+          0,
+          233,
+          0,
+          3,
+          0
+        ],
+        [
+          9,
+          0,
+          0,
+          0,
+          503,
+          2,
+          18
+        ],
+        [
+          0,
+          1,
+          0,
+          3,
+          1,
+          277,
+          7
+        ],
+        [
+          7,
+          1,
+          0,
+          0,
+          40,
+          4,
+          344
+        ]
+      ]
+    },
+    "focal_confusion_pairs": [
+      {
+        "class_pair": [
+          "DERMASON",
+          "SIRA"
+        ],
+        "test_mutual_errors": 58,
+        "validation_mutual_errors": 68
+      },
+      {
+        "class_pair": [
+          "BARBUNYA",
+          "CALI"
+        ],
+        "test_mutual_errors": 19,
+        "validation_mutual_errors": 21
+      }
+    ],
+    "metrics": {
+      "accuracy": 0.9324191968658179,
+      "balanced_accuracy": 0.9398971908347276,
+      "log_loss": 0.18102390031373491,
+      "macro_f1": 0.9418353636024855,
+      "macro_recall": 0.9398971908347276,
+      "minimum_per_class_recall": 0.8686868686868687,
+      "weighted_f1": 0.9321874638643965
+    },
+    "per_class": [
+      {
+        "class": "SEKER",
+        "f1": 0.9463414634146341,
+        "precision": 0.9356913183279743,
+        "recall": 0.9572368421052632,
+        "support": 304
+      },
+      {
+        "class": "BARBUNYA",
+        "f1": 0.9222797927461139,
+        "precision": 0.9518716577540107,
+        "recall": 0.8944723618090452,
+        "support": 199
+      },
+      {
+        "class": "BOMBAY",
+        "f1": 1.0,
+        "precision": 1.0,
+        "recall": 1.0,
+        "support": 78
+      },
+      {
+        "class": "CALI",
+        "f1": 0.9471544715447154,
+        "precision": 0.9395161290322581,
+        "recall": 0.9549180327868853,
+        "support": 244
+      },
+      {
+        "class": "DERMASON",
+        "f1": 0.9280442804428044,
+        "precision": 0.9112318840579711,
+        "recall": 0.9454887218045113,
+        "support": 532
+      },
+      {
+        "class": "HOROZ",
+        "f1": 0.9601386481802426,
+        "precision": 0.9618055555555556,
+        "recall": 0.9584775086505191,
+        "support": 289
+      },
+      {
+        "class": "SIRA",
+        "f1": 0.8888888888888888,
+        "precision": 0.91005291005291,
+        "recall": 0.8686868686868687,
+        "support": 396
+      }
+    ],
+    "probability_matrix_sha256": "257d67524492fa0bab04fd8ab2599dfe8325ebdb119f972e1ef8216cf2d94e5a",
+    "repeated_profile_sensitivity": {
+      "analysis_type": "non_destructive_repeated_feature_profile_sensitivity",
+      "interpretation": "Sensitivity only: the official test artifact remains complete; Repeated-profile evidence does not prove duplicate identity or leakage.",
+      "macro_f1_delta_excluding_minus_full": -0.00031231145327581533,
+      "official_full_test_row_count": 2042.0,
+      "repeated_profile_test_row_count": 15.0,
+      "sensitivity_row_count": 2027.0
+    },
+    "row_count": 2042,
+    "top_test_confusion_pairs": [
+      {
+        "class_pair": [
+          "DERMASON",
+          "SIRA"
+        ],
+        "mutual_errors": 58
+      },
+      {
+        "class_pair": [
+          "BARBUNYA",
+          "CALI"
+        ],
+        "mutual_errors": 19
+      },
+      {
+        "class_pair": [
+          "SEKER",
+          "DERMASON"
+        ],
+        "mutual_errors": 17
+      }
+    ]
+  },
+  "model_selection": {
+    "dummy_macro_f1_margin": 0.02,
+    "dummy_validation_macro_f1": 0.059052059052059055,
+    "family_search": [
+      {
+        "best_parameters": {
+          "model__class_weight": null,
+          "model__l2_regularization": 0.0,
+          "model__learning_rate": 0.05,
+          "model__max_iter": 250,
+          "model__max_leaf_nodes": 15,
+          "model__min_samples_leaf": 40
+        },
+        "candidate_count": 8,
+        "cv_macro_f1_mean": 0.9370121385632876,
+        "cv_macro_f1_std": 0.0038247869053157375,
+        "family": "HistGradientBoostingClassifier",
+        "model_id": "hist_gradient_boosting",
+        "search_strategy": "RandomizedSearchCV"
+      },
+      {
+        "best_parameters": {
+          "model__C": 1.0,
+          "model__class_weight": null
+        },
+        "candidate_count": 4,
+        "cv_macro_f1_mean": 0.9350306225351419,
+        "cv_macro_f1_std": 0.000995590911334026,
+        "family": "LogisticRegression",
+        "model_id": "logistic_regression",
+        "search_strategy": "GridSearchCV"
+      },
+      {
+        "best_parameters": {
+          "model__class_weight": null,
+          "model__max_depth": null,
+          "model__min_samples_leaf": 1,
+          "model__n_estimators": 120
+        },
+        "candidate_count": 8,
+        "cv_macro_f1_mean": 0.9333427904259789,
+        "cv_macro_f1_std": 0.003635304042879892,
+        "family": "RandomForestClassifier",
+        "model_id": "random_forest",
+        "search_strategy": "RandomizedSearchCV"
+      },
+      {
+        "best_parameters": {
+          "model__class_weight": "balanced",
+          "model__max_depth": 8,
+          "model__min_samples_leaf": 5
+        },
+        "candidate_count": 8,
+        "cv_macro_f1_mean": 0.9199041282260645,
+        "cv_macro_f1_std": 0.009697815535415896,
+        "family": "DecisionTreeClassifier",
+        "model_id": "decision_tree",
+        "search_strategy": "GridSearchCV"
+      }
+    ],
+    "feature_policy_candidates": [
+      {
+        "cv_macro_f1_mean": 0.9370121385632876,
+        "cv_macro_f1_std": 0.0038247869053157375,
+        "feature_count": 16,
+        "feature_policy": "all_features",
+        "model_id": "hist_gradient_boosting__all_features",
+        "validation_metrics": {
+          "accuracy": 0.9270323212536729,
+          "balanced_accuracy": 0.9391308599307318,
+          "log_loss": 0.22517215001326799,
+          "macro_f1": 0.9378814348554879,
+          "macro_recall": 0.9391308599307318,
+          "minimum_per_class_recall": 0.8708860759493671,
+          "weighted_f1": 0.9268991730331414
+        }
+      },
+      {
+        "cv_macro_f1_mean": 0.9183019179406531,
+        "cv_macro_f1_std": 0.004924224202905914,
+        "feature_count": 7,
+        "feature_policy": "without_confirmed_derived",
+        "model_id": "hist_gradient_boosting__without_confirmed_derived",
+        "validation_metrics": {
+          "accuracy": 0.9098922624877571,
+          "balanced_accuracy": 0.9209089382588139,
+          "log_loss": 0.278822692701108,
+          "macro_f1": 0.9199560441564535,
+          "macro_recall": 0.9209089382588139,
+          "minimum_per_class_recall": 0.8585858585858586,
+          "weighted_f1": 0.909667122332165
+        }
+      },
+      {
+        "cv_macro_f1_mean": 0.9361673662790764,
+        "cv_macro_f1_std": 0.004014395771272498,
+        "feature_count": 15,
+        "feature_policy": "without_shape_factor_2",
+        "model_id": "hist_gradient_boosting__without_shape_factor_2",
+        "validation_metrics": {
+          "accuracy": 0.9240940254652301,
+          "balanced_accuracy": 0.9381462280952386,
+          "log_loss": 0.2295804935338458,
+          "macro_f1": 0.936677022246986,
+          "macro_recall": 0.9381462280952385,
+          "minimum_per_class_recall": 0.8632911392405064,
+          "weighted_f1": 0.9239346411877809
+        }
+      },
+      {
+        "cv_macro_f1_mean": 0.9350306225351419,
+        "cv_macro_f1_std": 0.000995590911334026,
+        "feature_count": 16,
+        "feature_policy": "all_features",
+        "model_id": "logistic_regression__all_features",
+        "validation_metrics": {
+          "accuracy": 0.9162585700293829,
+          "balanced_accuracy": 0.9309075506559733,
+          "log_loss": 0.22251148646462465,
+          "macro_f1": 0.9289726887818729,
+          "macro_recall": 0.9309075506559733,
+          "minimum_per_class_recall": 0.8632911392405064,
+          "weighted_f1": 0.9161988315389281
+        }
+      },
+      {
+        "cv_macro_f1_mean": 0.9199408569203312,
+        "cv_macro_f1_std": 0.002834555538225011,
+        "feature_count": 7,
+        "feature_policy": "without_confirmed_derived",
+        "model_id": "logistic_regression__without_confirmed_derived",
+        "validation_metrics": {
+          "accuracy": 0.9025465230166504,
+          "balanced_accuracy": 0.9147902609270313,
+          "log_loss": 0.2719613967309885,
+          "macro_f1": 0.9154058922135254,
+          "macro_recall": 0.9147902609270313,
+          "minimum_per_class_recall": 0.8383838383838383,
+          "weighted_f1": 0.902683700472381
+        }
+      },
+      {
+        "cv_macro_f1_mean": 0.9348602281671351,
+        "cv_macro_f1_std": 0.0014216194856729845,
+        "feature_count": 15,
+        "feature_policy": "without_shape_factor_2",
+        "model_id": "logistic_regression__without_shape_factor_2",
+        "validation_metrics": {
+          "accuracy": 0.9162585700293829,
+          "balanced_accuracy": 0.9308144154671876,
+          "log_loss": 0.22344498121156411,
+          "macro_f1": 0.9289169346846183,
+          "macro_recall": 0.9308144154671876,
+          "minimum_per_class_recall": 0.8607594936708861,
+          "weighted_f1": 0.9161935995673909
+        }
+      }
+    ],
+    "practical_tie": true,
+    "practical_tie_tolerance": 0.002,
+    "primary_metric": "macro_f1",
+    "selected_feature_policy": "all_features",
+    "selected_hyperparameters": {
+      "model__class_weight": null,
+      "model__l2_regularization": 0.0,
+      "model__learning_rate": 0.05,
+      "model__max_iter": 250,
+      "model__max_leaf_nodes": 15,
+      "model__min_samples_leaf": 40
+    },
+    "selected_imbalance_policy": {
+      "class_weight": null,
+      "resampling": "none",
+      "strategy": "none"
+    },
+    "selected_model_family": "HistGradientBoostingClassifier",
+    "selected_model_id": "hist_gradient_boosting__all_features",
+    "selected_preprocessing": {
+      "categorical_processing": "not_applicable",
+      "feature_projection": [
+        "Area",
+        "Perimeter",
+        "MajorAxisLength",
+        "MinorAxisLength",
+        "AspectRatio",
+        "Eccentricity",
+        "ConvexArea",
+        "EquivDiameter",
+        "Extent",
+        "Solidity",
+        "Roundness",
+        "Compactness",
+        "ShapeFactor1",
+        "ShapeFactor2",
+        "ShapeFactor3",
+        "ShapeFactor4"
+      ],
+      "learned_preprocessing_in_notebook_02": false,
+      "numerical_scaling": "none",
+      "pipeline": "sklearn.pipeline.Pipeline",
+      "scaling_fit_scope": "inside_training_fold_or_final_training_only"
+    },
+    "selection_rationale": "Candidates within the declared validation macro-F1 tolerance were resolved by balanced accuracy, worst-class recall, CV stability, comparable log loss, simplicity, and stable model ID."
+  },
+  "protocol": {
+    "eda_partition": "train",
+    "eda_row_count": 9527,
+    "feature_policy_evidence_scope": "training_partition_exploration_only",
+    "final_fit_partitions": [
+      "train",
+      "validation"
+    ],
+    "held_out_partitions_used_for_eda": [],
+    "pre_split_full_source_checks": [
+      "source identity and schema",
+      "declared target class set",
+      "row-wise domain rules",
+      "missing and invalid values",
+      "exact-row structure (no source identifier)"
+    ],
+    "split_frozen_before_distribution_aware_eda": true,
+    "test_evaluation_count": 1,
+    "test_in_search": false,
+    "test_opened_after_freeze_and_final_fit": true,
+    "test_partition_prior_exposure": "The seed-42 test partition was also evaluated once by the superseded pre-correction execution. The corrected run re-derived every development decision from training-only evidence with the pre-declared seed, candidate space, metric, and tie rules; none of them was changed after that historical test result.",
+    "test_used_for_adjustment": false,
+    "validation_in_search": false
+  },
+  "runtime": {
+    "implementation": "CPython",
+    "lock_file": "pylock.toml",
+    "packages": {
+      "joblib": "1.5.3",
+      "matplotlib": "3.11.2",
+      "numpy": "2.5.3",
+      "pandas": "3.0.5",
+      "scikit-learn": "1.9.0",
+      "scipy": "1.18.1",
+      "ucimlrepo": "0.0.7"
+    },
+    "platform": "Linux-aarch64",
+    "python": "3.13.13",
+    "python_version_file": ".python-version",
+    "recorded_by_final_bundle": {
+      "joblib": "1.5.3",
+      "pandas": "3.0.5",
+      "python": "3.13.13",
+      "scikit_learn": "1.9.0"
+    }
+  },
+  "schema_version": "canonical-run.v1",
+  "seeds": {
+    "cross_validation": 42,
+    "estimators": 42,
+    "randomized_search": 42,
+    "split_first_stage": 42,
+    "split_second_stage": 43
+  },
+  "selected_cv_metrics": {
+    "cv_balanced_accuracy_mean": 0.9354242745920734,
+    "cv_log_loss_mean": 0.2581143487298275,
+    "cv_macro_f1_mean": 0.9370121385632876,
+    "cv_macro_f1_std": 0.0038247869053157375,
+    "cv_weighted_f1_mean": 0.924310373008779
+  },
+  "split": {
+    "class_counts": {
+      "test": {
+        "BARBUNYA": 199,
+        "BOMBAY": 78,
+        "CALI": 244,
+        "DERMASON": 532,
+        "HOROZ": 289,
+        "SEKER": 304,
+        "SIRA": 396
+      },
+      "train": {
+        "BARBUNYA": 925,
+        "BOMBAY": 365,
+        "CALI": 1141,
+        "DERMASON": 2482,
+        "HOROZ": 1350,
+        "SEKER": 1419,
+        "SIRA": 1845
+      },
+      "validation": {
+        "BARBUNYA": 198,
+        "BOMBAY": 79,
+        "CALI": 245,
+        "DERMASON": 532,
+        "HOROZ": 289,
+        "SEKER": 304,
+        "SIRA": 395
+      }
+    },
+    "membership_kind": "technical_row_occurrence",
+    "membership_sha256": {
+      "test": "534ff2e449106531a9f5f8bea14e5785b113ba821cde5e26bad5362fad5d2e5a",
+      "train": "34e9cb09dc42d27a53ced3ef811868b9b926a8f435999ab16e817b50a612609e",
+      "validation": "f2d74e5b98f7dca1df8268e135e7903c738578b10e2846bd9f38d27f666a5547"
+    },
+    "partition_sha256": {
+      "test": "5e17c1346e67cb4a786ebd11162b7e45099ded342b9de9755ab4f18f4068c175",
+      "train": "485594b308ad5e6bb36bfe6a7758ded01c061ed5062995cc89a3a13fc962e536",
+      "validation": "f379db8842c3de49d70c7fe4dd449cdc3220052f9d7bdd85d3051b927fb8fd94"
+    },
+    "policy": {
+      "evaluation_mode": "stratified_random_snapshot",
+      "shuffle": true,
+      "stratify_by": "Class",
+      "test_fraction": 0.15,
+      "train_fraction": 0.7,
+      "validation_fraction": 0.15
+    },
+    "repeated_profiles": {
+      "cross_partition_repeated_profile_groups": 31,
+      "proven_duplicate_identity": false,
+      "source_exact_row_equality_groups": 68,
+      "target_conflicting_profile_groups": 0
+    },
+    "row_counts": {
+      "test": 2042,
+      "train": 9527,
+      "validation": 2042
+    },
+    "split_method": "two_stage_sklearn_train_test_split_with_stratification_and_technical_row_occurrence_sorted_membership"
+  },
+  "superseded_reference": {
+    "cv_macro_f1_mean": 0.937012,
+    "final_test_metrics": {
+      "accuracy": 0.932419,
+      "balanced_accuracy": 0.939897,
+      "log_loss": 0.181024,
+      "macro_f1": 0.941835,
+      "weighted_f1": 0.932187
+    },
+    "reason": "Notebook 01 performed target-aware and distribution-aware exploration on the complete source before the split, so final-test rows contributed to the exploratory evidence behind feature-policy design. The corrected protocol freezes the split first and restricts exploration to train.",
+    "recorded_in": "README.md at commit 49cb600 (pre-correction documentation)",
+    "recorded_runtime": {
+      "joblib": "1.5.3",
+      "pandas": "3.0.5",
+      "python": "3.13.13",
+      "scikit_learn": "1.9.0"
+    },
+    "selected_model_id": "hist_gradient_boosting__all_features",
+    "status": "superseded_not_canonical",
+    "validation_macro_f1": 0.937881
+  },
+  "target": {
+    "column": "Class",
+    "decision_rule": "argmax_class_score_or_probability",
+    "estimator_class_order": [
+      "BARBUNYA",
+      "BOMBAY",
+      "CALI",
+      "DERMASON",
+      "HOROZ",
+      "SEKER",
+      "SIRA"
+    ],
+    "positive_class": null,
+    "problem_type": "multiclass_classification",
+    "public_class_order": [
+      "SEKER",
+      "BARBUNYA",
+      "BOMBAY",
+      "CALI",
+      "DERMASON",
+      "HOROZ",
+      "SIRA"
+    ],
+    "semantics": "nominal_unordered"
+  },
+  "validation_metrics": {
+    "accuracy": 0.9270323212536729,
+    "balanced_accuracy": 0.9391308599307318,
+    "log_loss": 0.22517215001326799,
+    "macro_f1": 0.9378814348554879,
+    "macro_recall": 0.9391308599307318,
+    "minimum_per_class_recall": 0.8708860759493671,
+    "weighted_f1": 0.9268991730331414
+  },
+  "validation_per_class": [
+    {
+      "class": "SEKER",
+      "f1": 0.9545454545454546,
+      "precision": 0.9423076923076923,
+      "recall": 0.9671052631578947,
+      "support": 304
+    },
+    {
+      "class": "BARBUNYA",
+      "f1": 0.9309462915601023,
+      "precision": 0.9430051813471503,
+      "recall": 0.9191919191919192,
+      "support": 198
+    },
+    {
+      "class": "BOMBAY",
+      "f1": 0.9937106918238994,
+      "precision": 0.9875,
+      "recall": 1.0,
+      "support": 79
+    },
+    {
+      "class": "CALI",
+      "f1": 0.9397590361445783,
+      "precision": 0.924901185770751,
+      "recall": 0.9551020408163265,
+      "support": 245
+    },
+    {
+      "class": "DERMASON",
+      "f1": 0.9178470254957507,
+      "precision": 0.9222011385199241,
+      "recall": 0.9135338345864662,
+      "support": 532
+    },
+    {
+      "class": "HOROZ",
+      "f1": 0.9530434782608695,
+      "precision": 0.958041958041958,
+      "recall": 0.9480968858131488,
+      "support": 289
+    },
+    {
+      "class": "SIRA",
+      "f1": 0.8753180661577609,
+      "precision": 0.8797953964194374,
+      "recall": 0.8708860759493671,
+      "support": 395
+    }
+  ]
+}

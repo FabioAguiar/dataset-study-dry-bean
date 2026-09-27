@@ -1736,6 +1736,98 @@ def analyze_repeated_profiles_across_partitions(
     }
 
 
+DEVELOPMENT_SPLIT_SCHEMA_VERSION = "development-split.v1"
+_PARTITION_NAMES = ("train", "validation", "test")
+
+
+def _membership_sha256(values: Sequence[str]) -> str:
+    return hashlib.sha256(
+        "\n".join(str(value) for value in values).encode("utf-8")
+    ).hexdigest()
+
+
+def build_development_split_reference(
+    partitions: DatasetPartitions,
+    *,
+    policy: ClassificationSplitPolicy,
+    eda_partition: str = "train",
+) -> dict[str, Any]:
+    """Fingerprint a split frozen before any distribution-aware analysis.
+
+    The reference lets exploration declare which partition it analysed and lets
+    later stages prove that they reproduced exactly the same membership. It
+    stores hashes and counts only; no row content is persisted.
+    """
+    if eda_partition not in _PARTITION_NAMES:
+        raise SplitPolicyError(f"Unknown EDA partition: {eda_partition!r}.")
+    if eda_partition == "test":
+        raise SplitPolicyError("Exploration must never analyse the final test partition.")
+    frames = partitions.as_mapping()
+    membership = partitions.membership_mapping()
+    if set(membership) != set(_PARTITION_NAMES):
+        raise SplitPolicyError("Partition membership must cover train/validation/test.")
+    return {
+        "schema_version": DEVELOPMENT_SPLIT_SCHEMA_VERSION,
+        "split_frozen_before_distribution_aware_analysis": True,
+        "policy": policy.as_dict(),
+        "split_method": partitions.split_method,
+        "membership_kind": partitions.membership_kind,
+        "row_counts": {name: int(len(frames[name])) for name in _PARTITION_NAMES},
+        "partition_sha256": {
+            name: fingerprint_dataframe_csv(frames[name]) for name in _PARTITION_NAMES
+        },
+        "membership_sha256": {
+            name: _membership_sha256(membership[name]) for name in _PARTITION_NAMES
+        },
+        "eda_partition": eda_partition,
+        "eda_row_count": int(len(frames[eda_partition])),
+        "held_out_partitions_used_for_eda": [],
+    }
+
+
+def validate_partitions_against_development_split(
+    partitions: DatasetPartitions,
+    *,
+    policy: ClassificationSplitPolicy,
+    reference: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fail closed unless partitions reproduce the split frozen before EDA."""
+    if reference.get("schema_version") != DEVELOPMENT_SPLIT_SCHEMA_VERSION:
+        raise PartitionValidationError("Unexpected development-split schema version.")
+    if reference.get("split_frozen_before_distribution_aware_analysis") is not True:
+        raise PartitionValidationError("Development split was not frozen before EDA.")
+    if reference.get("eda_partition") == "test" or reference.get(
+        "held_out_partitions_used_for_eda"
+    ):
+        raise PartitionValidationError("Held-out partitions were declared as EDA input.")
+    observed = build_development_split_reference(
+        partitions,
+        policy=policy,
+        eda_partition=str(reference.get("eda_partition")),
+    )
+    checks = {
+        "policy": semantically_equivalent(observed["policy"], reference.get("policy")),
+        "row_counts": observed["row_counts"] == reference.get("row_counts"),
+        "partition_sha256": observed["partition_sha256"] == reference.get("partition_sha256"),
+        "membership_sha256": observed["membership_sha256"] == reference.get("membership_sha256"),
+        "eda_row_count": observed["eda_row_count"] == reference.get("eda_row_count"),
+    }
+    failed = sorted(name for name, passed in checks.items() if not passed)
+    if failed:
+        raise PartitionValidationError(
+            "Partitions differ from the split frozen before exploration: "
+            + ", ".join(failed)
+            + "."
+        )
+    return {
+        "development_split_schema_version": DEVELOPMENT_SPLIT_SCHEMA_VERSION,
+        "reproduces_split_frozen_before_eda": True,
+        "eda_partition": observed["eda_partition"],
+        "eda_row_count": observed["eda_row_count"],
+        "checks": checks,
+    }
+
+
 def _relative_posix(path: str | Path) -> str:
     candidate = Path(path)
     if candidate.is_absolute():
@@ -1827,8 +1919,14 @@ def build_feature_manifest(
     target_encoding: Mapping[Any, int] | None = None,
     problem_type: str | None = None,
     target_semantics: str | None = None,
+    development_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build an ordered feature and future-preprocessing contract."""
+    """Build an ordered feature and future-preprocessing contract.
+
+    ``development_evidence`` optionally carries feature-governance evidence
+    derived only from the exploration partition (for example, confirmed derived
+    dependencies) so model selection can consume it without reopening EDA.
+    """
     features = tuple(feature_columns)
     numerical = tuple(numerical_features)
     categorical = tuple(categorical_features)
@@ -1898,6 +1996,8 @@ def build_feature_manifest(
             "persisted_labels_remain_readable": True,
             "encoding_required_for_persisted_target": False,
         }
+    if development_evidence is not None:
+        payload["development_evidence"] = _copy_mapping(development_evidence)
     return payload
 
 
@@ -1910,6 +2010,7 @@ def build_split_manifest(
     partition_paths: Mapping[str, str | Path],
     partition_sha256: Mapping[str, str],
     repeated_profile_evidence: Mapping[str, Any] | None = None,
+    development_split_verification: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a versioned split manifest with explicit membership."""
     paths = {name: _relative_posix(path) for name, path in partition_paths.items()}
@@ -1950,6 +2051,10 @@ def build_split_manifest(
     if repeated_profile_evidence is not None:
         payload["repeated_profile_evidence"] = _copy_mapping(
             repeated_profile_evidence
+        )
+    if development_split_verification is not None:
+        payload["development_split_verification"] = _copy_mapping(
+            development_split_verification
         )
     return payload
 

@@ -9,21 +9,35 @@ description = "Reproducible Dry Bean dataset study"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
+# Human-declared contract. The exact interpreter of the canonical run is in
+# .python-version and the resolved environment is the machine-generated
+# pylock.toml (see README, "Environment").
 dependencies = [
     "ucimlrepo>=0.0.7",
+    "numpy>=1.24",
     "pandas>=2.0",
     "scikit-learn>=1.2",
     "joblib>=1.3",
+    "matplotlib>=3.10",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
+# Headless notebook execution used by the canonical run.
 notebook = [
     "ipykernel>=6.0",
-    "jupyterlab>=4.0",
-    "matplotlib>=3.8",
+    "nbconvert>=7.0",
 ]
 test = [
     "pytest>=8.0",
+]
+# Interactive authoring only; not part of the canonical locked environment.
+interactive = [
+    "jupyterlab>=4.0",
+]
+dev = [
+    { include-group = "notebook" },
+    { include-group = "test" },
+    { include-group = "interactive" },
 ]
 
 [tool.setuptools.packages.find]

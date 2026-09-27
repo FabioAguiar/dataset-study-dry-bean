@@ -1,9 +1,11 @@
 """Versioned Notebook-01 exploration handoff for static multiclass studies.
 
 The module serializes validated exploratory contracts and preparation decisions
-without executing preparation, splitting, preprocessing, feature selection, or
-model fitting. The resulting JSON is intended to be reloadable from a fresh
-kernel by the next notebook.
+without executing preparation, preprocessing, feature selection, or model
+fitting. Since schema v2 the handoff also records the development split that was
+frozen *before* any distribution-aware or target-aware exploration, together
+with the partition that exploration was restricted to. The resulting JSON is
+intended to be reloadable from a fresh kernel by the next notebook.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 
 
-HANDOFF_SCHEMA_VERSION = "exploration-handoff.v1"
+HANDOFF_SCHEMA_VERSION = "exploration-handoff.v2"
 HANDOFF_ARTIFACT_TYPE = "exploration_handoff"
 
 _ISSUE_COLUMNS = ["Scope", "Issue", "Details"]
@@ -310,11 +312,12 @@ def _next_steps() -> pd.DataFrame:
         {
             "Notebook": "02_data_preparation.ipynb",
             "Sequence": 5,
-            "Action": "Execute the approved stratified 70/15/15 snapshot split",
+            "Action": "Re-execute the stratified 70/15/15 split frozen before exploration",
             "Status": "Ready",
             "Acceptance criterion": (
-                "Train, validation, and test partitions are reproducible, disjoint, "
-                "class-aware, and generated with the declared random seed."
+                "Train, validation, and test partitions reproduce the row counts, "
+                "partition hashes, and membership hashes frozen in Notebook 01 "
+                "before any distribution-aware analysis."
             ),
         },
         {
@@ -583,8 +586,16 @@ def build_static_multiclass_exploration_handoff(
     quality_report: object,
     insights_report: object,
     preparation_report: object,
+    class_profile_report: object,
+    development_split: Mapping[str, Any],
 ) -> ExplorationHandoffReport:
-    """Build the final Notebook-01 handoff without modifying analytical data."""
+    """Build the final Notebook-01 handoff without modifying analytical data.
+
+    ``source_dataframe`` is the complete validated source and is used only for
+    structural identity (row count, column order). Distribution-aware reports
+    must have been computed on ``development_split["eda_partition"]`` only;
+    their observed row counts are checked against that partition.
+    """
     issues: list[dict[str, str]] = []
 
     slug = _text(dataset_slug)
@@ -632,6 +643,17 @@ def build_static_multiclass_exploration_handoff(
     ]
     if unknown_roles:
         issues.append({"Scope": "Roles", "Issue": "Declared fields missing from source", "Details": repr(tuple(unknown_roles))})
+
+    split_issues, split_payload = _validate_development_split(
+        development_split,
+        source_row_count=int(len(source_dataframe)) if isinstance(source_dataframe, pd.DataFrame) else 0,
+        target_report=target_report,
+        row_count_reports=(
+            ("leakage_report", leakage_report),
+            ("class_profile_report", class_profile_report),
+        ),
+    )
+    issues.extend(split_issues)
 
     contract_checks = (
         ("Target distribution", not bool(getattr(target_report, "has_issues", True))),
@@ -796,6 +818,8 @@ def build_static_multiclass_exploration_handoff(
                 ),
             },
         },
+        "development_split": split_payload,
+        "class_overlap": _class_overlap(class_profile_report),
         "open_reviews": open_reviews,
         "continuation": {
             "next_steps": _frame_records(next_steps),
@@ -819,6 +843,120 @@ def build_static_multiclass_exploration_handoff(
         next_steps=next_steps,
         expected_outputs=expected_outputs,
     )
+
+
+def _validate_development_split(
+    development_split: Mapping[str, Any],
+    *,
+    source_row_count: int,
+    target_report: object,
+    row_count_reports: Sequence[tuple[str, object]],
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    issues: list[dict[str, str]] = []
+
+    def issue(name: str, details: str) -> None:
+        issues.append({"Scope": "Development split", "Issue": name, "Details": details})
+
+    if not isinstance(development_split, Mapping):
+        issue("Missing development split", "A frozen split reference is required")
+        return issues, {}
+    payload = _json_safe(deepcopy(dict(development_split)))
+    if payload.get("split_frozen_before_distribution_aware_analysis") is not True:
+        issue("Split not frozen before EDA", "Distribution-aware exploration must follow the split")
+    eda_partition = payload.get("eda_partition")
+    if eda_partition != "train":
+        issue("Unexpected EDA partition", f"eda_partition={eda_partition!r}; expected 'train'")
+    if payload.get("held_out_partitions_used_for_eda"):
+        issue("Held-out data used in EDA", repr(payload.get("held_out_partitions_used_for_eda")))
+    row_counts = payload.get("row_counts", {})
+    if set(row_counts) != {"train", "validation", "test"}:
+        issue("Incomplete partition row counts", repr(sorted(row_counts)))
+    elif sum(int(value) for value in row_counts.values()) != source_row_count:
+        issue("Partition rows do not cover the source", f"{sum(row_counts.values())} != {source_row_count}")
+    eda_rows = payload.get("eda_row_count")
+    if eda_partition in row_counts and eda_rows != row_counts[eda_partition]:
+        issue("EDA row count mismatch", f"{eda_rows!r} != {row_counts[eda_partition]!r}")
+    for key in ("partition_sha256", "membership_sha256"):
+        if set(payload.get(key, {})) != {"train", "validation", "test"}:
+            issue("Missing split fingerprints", key)
+
+    try:
+        distribution = target_report.distribution_frame(format_percentages=False)
+        observed_target_rows = int(pd.to_numeric(distribution["Count"]).sum())
+    except (AttributeError, KeyError, TypeError, ValueError):
+        observed_target_rows = None
+    if observed_target_rows != eda_rows:
+        issue(
+            "Target exploration scope differs from EDA partition",
+            f"target_report rows={observed_target_rows!r}, eda_row_count={eda_rows!r}",
+        )
+    for name, report in row_count_reports:
+        observed = getattr(report, "row_count", None)
+        if observed is not None and int(observed) != eda_rows:
+            issue(
+                "Exploration scope differs from EDA partition",
+                f"{name} rows={observed!r}, eda_row_count={eda_rows!r}",
+            )
+    payload["distribution_aware_reports_scope"] = eda_partition
+    return issues, payload
+
+
+def _class_overlap(class_profile_report: object) -> dict[str, Any]:
+    frame = class_profile_report.pairwise_overlap_frame()
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {"highest_overlap_pair": None, "ranked_pairs": []}
+    columns = [
+        column
+        for column in (
+            "Class A",
+            "Class B",
+            "Mean IQR overlap coefficient",
+            "RMS robust median gap",
+        )
+        if column in frame.columns
+    ]
+    first = frame.iloc[0]
+    return {
+        "highest_overlap_pair": [_text(first["Class A"]), _text(first["Class B"])],
+        "ranked_pairs": _frame_records(frame.head(10), columns=columns),
+        "interpretation_boundary": (
+            "Descriptive train-partition profile overlap; not an estimate of "
+            "classifier confusion."
+        ),
+    }
+
+
+def development_feature_evidence(handoff: Mapping[str, Any]) -> dict[str, Any]:
+    """Summarize train-only exploration evidence consumed by model selection.
+
+    Model selection uses this summary to build dependency-aware feature-policy
+    ablations and the exploratory overlap hypothesis without reopening EDA.
+    """
+    split = handoff.get("development_split") or {}
+    dependencies = handoff.get("leakage_and_dependencies", {}).get("dependencies", [])
+    confirmed = [
+        str(row["Derived feature"])
+        for row in dependencies
+        if row.get("Dependency status") == "Confirmed from retained columns"
+    ]
+    unresolved = [
+        str(row["Derived feature"])
+        for row in dependencies
+        if row.get("Dependency status") == "Declared dependency not confirmed"
+    ]
+    overlap = handoff.get("class_overlap", {}).get("highest_overlap_pair")
+    return {
+        "source_artifact": "exploration_handoff",
+        "source_schema_version": handoff.get("schema_version"),
+        "eda_partition": split.get("eda_partition"),
+        "eda_row_count": split.get("eda_row_count"),
+        "held_out_partitions_used_for_eda": list(
+            split.get("held_out_partitions_used_for_eda", [])
+        ),
+        "confirmed_derived_features": confirmed,
+        "unresolved_provenance_features": unresolved,
+        "highest_overlap_class_pair": list(overlap) if overlap else None,
+    }
 
 
 def load_and_validate_exploration_handoff(
@@ -848,6 +986,7 @@ def load_and_validate_exploration_handoff(
         "prediction_contract",
         "feature_contract",
         "preparation_contract",
+        "development_split",
         "continuation",
         "readiness",
     }
@@ -886,6 +1025,17 @@ def load_and_validate_exploration_handoff(
     if readiness.get("split_execution_ready") is not True:
         raise ExplorationHandoffError(
             "Exploration handoff does not authorize split execution."
+        )
+
+    development_split = payload["development_split"]
+    if (
+        development_split.get("split_frozen_before_distribution_aware_analysis") is not True
+        or development_split.get("eda_partition") != "train"
+        or development_split.get("held_out_partitions_used_for_eda")
+    ):
+        raise ExplorationHandoffError(
+            "Exploration handoff does not prove that EDA followed a frozen split "
+            "and used the training partition only."
         )
 
     target = payload["prediction_contract"].get("target_column")

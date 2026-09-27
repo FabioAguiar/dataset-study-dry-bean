@@ -2436,10 +2436,25 @@ def compare_multiclass_confusion_pairs(
     validation_confusion: Mapping[str, Any],
     test_confusion: Mapping[str, Any],
     target_classes: Sequence[Any],
-    focal_pairs: Sequence[Sequence[Any]] = (("DERMASON", "SIRA"), ("BARBUNYA", "CALI")),
+    focal_pairs: Sequence[Sequence[Any]] | None = None,
 ) -> dict[str, Any]:
+    """Compare frozen focal class pairs between validation and test confusion.
+
+    Focal pairs must be fixed before test access. When omitted, the pair with
+    the largest mutual validation confusion is used, so no test-derived or
+    hard-coded pair can enter the comparison.
+    """
     validation_pairs = _rank_multiclass_confusion_pairs(validation_confusion, target_classes)
     test_pairs = _rank_multiclass_confusion_pairs(test_confusion, target_classes)
+    if focal_pairs is None:
+        focal_pairs = (validation_pairs[0]["class_pair"],)
+    unique_pairs: list[list[Any]] = []
+    for pair in focal_pairs:
+        if len(pair) != 2 or len(set(pair)) != 2 or not set(pair) <= set(target_classes):
+            raise FinalizationContractError(f"Invalid focal class pair: {list(pair)!r}.")
+        if not any(set(pair) == set(existing) for existing in unique_pairs):
+            unique_pairs.append(list(pair))
+    focal_pairs = unique_pairs
 
     def locate(rows: Sequence[Mapping[str, Any]], pair: Sequence[Any]) -> Mapping[str, Any]:
         wanted = set(pair)
@@ -2590,8 +2605,13 @@ def evaluate_multiclass_final_model_once(
     contract: MulticlassFrozenFinalizationContract,
     validation_evidence: Mapping[str, Any],
     guard: EvaluationGuard,
+    focal_pairs: Sequence[Sequence[Any]] | None = None,
 ) -> MulticlassFinalEvaluation:
-    """Evaluate test exactly once; no search space or alternative candidate is accepted."""
+    """Evaluate test exactly once; no search space or alternative candidate is accepted.
+
+    ``focal_pairs`` must come from evidence frozen before test access (for
+    example the model-selection handoff); it only shapes descriptive reporting.
+    """
 
     if guard.evaluated or guard.probability_call_count:
         raise DuplicateTestEvaluationError("Test probability evaluation was already consumed.")
@@ -2629,6 +2649,7 @@ def evaluate_multiclass_final_model_once(
         validation_confusion=validation_evidence["confusion_matrix"],
         test_confusion=computed["confusion_matrix"],
         target_classes=output_order,
+        focal_pairs=focal_pairs,
     )
     sensitivity = compute_multiclass_repeated_profile_sensitivity(
         final_training_features=final_training_features,
