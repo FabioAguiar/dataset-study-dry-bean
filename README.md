@@ -502,17 +502,22 @@ python -m scripts.download_data uci \
   --destination data/raw/dry-bean
 ```
 
-Execute notebooks in order from 01 to 05 starting without runtime artifacts. To preserve clean source notebooks, execute copies rather than using `--inplace`:
+Execute the five notebooks in order, each in a fresh kernel, with the notebook runner:
 
 ```bash
-jupyter nbconvert --to notebook --execute notebooks/01_data_understanding_and_exploration.ipynb --output-dir build/executed
-jupyter nbconvert --to notebook --execute notebooks/02_data_preparation.ipynb --output-dir build/executed
-jupyter nbconvert --to notebook --execute notebooks/03_model_selection_and_evaluation.ipynb --output-dir build/executed --ExecutePreprocessor.timeout=3600
-jupyter nbconvert --to notebook --execute notebooks/04_final_model_and_bundle.ipynb --output-dir build/executed
-jupyter nbconvert --to notebook --execute notebooks/05_inference_demo.ipynb --output-dir build/executed
+python -m scripts.run_notebooks --fresh
 ```
 
-Executed copies under `build/` are ignored by Git. Artifact writers are fail-closed: an existing divergent artifact set is never overwritten, so delete `artifacts/*/dry-bean/` and `data/processed/dry-bean/` before a full re-execution.
+The versioned notebooks are clean sources and must stay that way (`tests/test_notebooks_clean.py`). The runner therefore never executes them in place:
+
+- each notebook is read into memory and that copy is executed in a new kernel whose working directory is `notebooks/`;
+- the kernel is pinned to the interpreter running the command (a temporary kernelspec), so a user-level `python3` kernel cannot silently switch environments;
+- the runner fails if a source notebook is not clean before execution, if its bytes change during execution, or if `git status` shows new notebook changes afterwards;
+- data, artifacts, and figures are written by the notebook code to their usual locations (`data/`, `artifacts/`, `docs/images/`).
+
+Artifact writers are fail-closed: an existing divergent artifact set is never overwritten. `--fresh` deletes the ignored, regenerable runtime outputs (`artifacts/*/dry-bean/`, `data/interim/dry-bean/`, `data/processed/dry-bean/`) first; the raw source in `data/raw/` is kept. Other options: `--only <notebook>.ipynb ...` runs a subset in official order, `--timeout` sets the per-cell timeout (default 3600 s), and `--keep-executed build/executed` keeps the executed copies for inspection (the directory must be Git-ignored; by default executed copies are discarded).
+
+Do not use `jupyter nbconvert --execute --inplace` on `notebooks/`: it writes outputs and execution counts into the versioned sources and makes the clean-notebook tests fail. A manual equivalent of the runner is `jupyter nbconvert --to notebook --execute notebooks/<name>.ipynb --output-dir build/executed`, run from the repository root with the environment's own kernel.
 
 Compare the fresh run with the canonical reference:
 
@@ -522,7 +527,7 @@ python -m scripts.canonical_run verify
 
 The verifier requires exact equality for source and partition hashes, class and feature order, seeds, the selected model, hyperparameters, and the final-test confusion matrix. Metrics must agree within `1e-9`. Model-artifact and probability hashes must also match when the runtime equals the reference runtime; under a different runtime they are reported but not required. The report also states whether the current environment matches `.python-version` and `pylock.toml`.
 
-Known third-party warning: with the locked joblib 1.5.3 and NumPy 2.5, loading pickled arrays emits a NumPy `DeprecationWarning` ("Setting the shape on a NumPy array"). It is fixed upstream in joblib 1.6.0. It is left visible and unsuppressed so that the locked environment stays the one that produced the manifest.
+Known third-party warning: with the locked joblib 1.5.3 and NumPy 2.5.3, every `joblib.load` of a pickled array emits a NumPy `DeprecationWarning` ("Setting the shape on a NumPy array has been deprecated in NumPy 2.5") from `joblib/numpy_pickle.py`. It is cosmetic in the locked environment: joblib assigns `.shape` to a freshly allocated contiguous 1-D buffer, which is exactly equivalent to `reshape` and never copies or reorders data; C- and Fortran-ordered arrays round-trip bit-exactly, and the model artifact is SHA-256-verified before loading and its fitted-state fingerprint (and, at serialization time, its round-trip probabilities) checked after. The only real risk is future: a NumPy release that removes the `.shape` setter would make joblib 1.5.3 fail to load, which the lock excludes. joblib 1.6.0 replaces the assignment with `reshape`. The warning is left visible and unsuppressed so that the locked environment stays the one that produced the manifest; upgrading joblib is a deliberate lock update (see [Updating the lock](#updating-the-lock)).
 
 ## Tests
 
