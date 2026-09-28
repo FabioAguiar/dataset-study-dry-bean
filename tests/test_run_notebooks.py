@@ -23,11 +23,10 @@ def _write_notebook(path: Path, sources: list[str]) -> None:
 
 
 def test_runner_covers_exactly_the_official_notebooks() -> None:
-    from tests.test_notebooks_clean import OFFICIAL_NOTEBOOKS
-
-    assert run_notebooks.OFFICIAL_NOTEBOOKS == OFFICIAL_NOTEBOOKS
+    official = run_notebooks.OFFICIAL_NOTEBOOKS
     present = tuple(sorted(path.name for path in (ROOT / "notebooks").glob("*.ipynb")))
-    assert present == OFFICIAL_NOTEBOOKS
+    assert present == official
+    assert [name[:3] for name in official] == ["01_", "02_", "03_", "04_", "05_"]
 
 
 def test_notebook_is_clean_detects_outputs_and_counts() -> None:

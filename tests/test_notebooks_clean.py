@@ -5,14 +5,7 @@ from pathlib import Path
 
 import pytest
 
-
-OFFICIAL_NOTEBOOKS = (
-    "01_data_understanding_and_exploration.ipynb",
-    "02_data_preparation.ipynb",
-    "03_model_selection_and_evaluation.ipynb",
-    "04_final_model_and_bundle.ipynb",
-    "05_inference_demo.ipynb",
-)
+from scripts.run_notebooks import OFFICIAL_NOTEBOOKS
 
 
 @pytest.mark.parametrize("notebook_name", OFFICIAL_NOTEBOOKS)
